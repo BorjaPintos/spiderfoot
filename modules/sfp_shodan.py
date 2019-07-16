@@ -11,6 +11,7 @@
 # -------------------------------------------------------------------------------
 
 import json
+import urllib
 from netaddr import IPNetwork
 from sflib import SpiderFoot, SpiderFootPlugin, SpiderFootEvent
 
@@ -89,8 +90,12 @@ class sfp_shodan(SpiderFootPlugin):
         return info
 
     def searchHtml(self, qry):
-        res = self.sf.fetchUrl("https://api.shodan.io/shodan/host/search?query=http.html:" + qry +
-                               "&key=" + self.opts['api_key'],
+        params = {
+            'query': 'http.html:"' + qry.encode('raw_unicode_escape') + '"',
+            'key': self.opts['api_key']
+        }
+
+        res = self.sf.fetchUrl("https://api.shodan.io/shodan/host/search?" + urllib.urlencode(params),
                                timeout=self.opts['_fetchtimeout'], useragent="SpiderFoot")
         if res['content'] is None:
             self.sf.info("No SHODAN info found for " + qry)
@@ -142,6 +147,10 @@ class sfp_shodan(SpiderFootPlugin):
             except BaseException as e:
                 self.sf.error("Unable to parse WEB_ANALYTICS_ID: " +
                               eventData + " (" + str(e) + ")", False)
+                return None
+
+            if network not in ['Google AdSense', 'Google Analytics', 'Google Site Verification']:
+                self.sf.debug("Skipping " + eventData + ", as not supported.")
                 return None
 
             rec = self.searchHtml(analytics_id)
