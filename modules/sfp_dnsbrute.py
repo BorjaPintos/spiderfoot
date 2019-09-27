@@ -11,14 +11,10 @@
 # Licence:     GPL
 # -------------------------------------------------------------------------------
 
-import socket
-import re
 import dns
 import random
 import threading
-import urllib2
 import time
-from netaddr import IPAddress, IPNetwork
 from sflib import SpiderFoot, SpiderFootPlugin, SpiderFootEvent
 
 class sfp_dnsbrute(SpiderFootPlugin):
@@ -121,7 +117,7 @@ class sfp_dnsbrute(SpiderFootPlugin):
         # Spawn threads for scanning
         self.sf.info("Spawning threads to check hosts: " + str(hostList))
         for name in hostList:
-            tn = 'sfp_dnsbrute_' + str(random.randint(0, 999999999))
+            tn = 'sfp_dnsbrute_' + str(random.SystemRandom().randint(0, 999999999))
             t.append(threading.Thread(name=tn, target=self.tryHost, args=(name,)))
             t[i].start()
             i += 1

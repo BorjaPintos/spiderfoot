@@ -13,7 +13,6 @@
 
 import socket
 import dns.resolver
-from netaddr import IPNetwork
 from sflib import SpiderFoot, SpiderFootPlugin, SpiderFootEvent
 
 
@@ -94,7 +93,7 @@ class sfp_yandexdns(SpiderFootPlugin):
 
         found = self.queryAddr(eventData)
 
-        if not found:
+        if found:
             return None
 
         if eventName == "CO_HOSTED_SITE":

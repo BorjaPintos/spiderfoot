@@ -12,7 +12,6 @@
 # -------------------------------------------------------------------------------
 
 import re
-from hashlib import sha256
 from sflib import SpiderFoot, SpiderFootPlugin, SpiderFootEvent
 
 class sfp_webanalytics(SpiderFootPlugin):
@@ -84,6 +83,7 @@ class sfp_webanalytics(SpiderFootPlugin):
                 self.notifyListeners(evt)
 
             # Google Website Verification
+            # https://developers.google.com/site-verification/v1/getting_started
             matches = re.findall(r'<meta name="google-site-verification" content="([a-z0-9\-\+_=]{43,44})"', eventData, re.IGNORECASE)
             for m in matches:
                 self.sf.debug("Google Site Verification match: " + m)
@@ -121,6 +121,7 @@ class sfp_webanalytics(SpiderFootPlugin):
 
         if eventName == 'DNS_TEXT':
             # Google Website Verification
+            # https://developers.google.com/site-verification/v1/getting_started
             matches = re.findall(r'google-site-verification=([a-z0-9\-\+_=]{43,44})$', eventData.strip(), re.IGNORECASE)
             for m in matches:
                 evt = SpiderFootEvent("WEB_ANALYTICS_ID",
@@ -145,6 +146,7 @@ class sfp_webanalytics(SpiderFootPlugin):
                 self.notifyListeners(evt)
 
             # DocuSign Domain Verification
+            # https://support.docusign.com/en/guides/org-admin-guide-domains
             matches = re.findall(r'docusign=([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$', eventData.strip(), re.IGNORECASE)
             for m in matches:
                 evt = SpiderFootEvent("WEB_ANALYTICS_ID",
@@ -153,6 +155,7 @@ class sfp_webanalytics(SpiderFootPlugin):
                 self.notifyListeners(evt)
 
             # GlobalSign Site Verification
+            # https://support.globalsign.com/customer/en/portal/articles/2167245-performing-domain-verification---dns-txt-record
             matches = re.findall(r'globalsign-domain-verification=([a-z0-9\-\+_=]{42,44})$', eventData.strip(), re.IGNORECASE)
             for m in matches:
                 evt = SpiderFootEvent("WEB_ANALYTICS_ID",
@@ -161,6 +164,7 @@ class sfp_webanalytics(SpiderFootPlugin):
                 self.notifyListeners(evt)
 
             # Atlassian Domain Verification
+            # https://confluence.atlassian.com/cloud/verify-a-domain-for-your-organization-873871234.html
             matches = re.findall(r'atlassian-domain-verification=([a-z0-9\-\+\/_=]{64})$', eventData.strip(), re.IGNORECASE)
             for m in matches:
                 evt = SpiderFootEvent("WEB_ANALYTICS_ID",
@@ -169,6 +173,7 @@ class sfp_webanalytics(SpiderFootPlugin):
                 self.notifyListeners(evt)
 
             # Adobe IDP Site Verification
+            # https://helpx.adobe.com/au/enterprise/using/verify-domain-ownership.html
             matches = re.findall(r'adobe-idp-site-verification=([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$', eventData.strip(), re.IGNORECASE)
             for m in matches:
                 evt = SpiderFootEvent("WEB_ANALYTICS_ID",
@@ -184,10 +189,30 @@ class sfp_webanalytics(SpiderFootPlugin):
                 self.notifyListeners(evt)
 
             # Adobe Domain Verification
+            # https://helpx.adobe.com/sign/help/domain_claiming.html
             matches = re.findall(r'adobe-sign-verification=([a-f0-9]{32})$', eventData.strip(), re.IGNORECASE)
             for m in matches:
                 evt = SpiderFootEvent("WEB_ANALYTICS_ID",
                                       "Adobe Domain Verification: " + m,
+                                      self.__name__, parentEvent)
+                self.notifyListeners(evt)
+
+            # Stripe Domain Verification
+            # https://stripe.com/docs/apple-pay/web#going-live
+            matches = re.findall(r'stripe-verification=([a-f0-9]{64})$', eventData.strip(), re.IGNORECASE)
+            for m in matches:
+                evt = SpiderFootEvent("WEB_ANALYTICS_ID",
+                                      "Stripe Domain Verification: " + m,
+                                      self.__name__, parentEvent)
+                self.notifyListeners(evt)
+
+
+            # TeamViewer SSO Verification
+            # https://community.teamviewer.com/t5/Knowledge-Base/Single-Sign-On-SSO/ta-p/30784
+            matches = re.findall(r'teamviewer-sso-verification=([a-f0-9]{32})$', eventData.strip(), re.IGNORECASE)
+            for m in matches:
+                evt = SpiderFootEvent("WEB_ANALYTICS_ID",
+                                      "TeamViewer SSO Verification: " + m,
                                       self.__name__, parentEvent)
                 self.notifyListeners(evt)
 
@@ -200,6 +225,7 @@ class sfp_webanalytics(SpiderFootPlugin):
                 self.notifyListeners(evt)
 
             # Facebook Domain Verification
+            # https://developers.facebook.com/docs/sharing/domain-verification/
             matches = re.findall(r'facebook-domain-verification=([a-z0-9]{30})$', eventData.strip(), re.IGNORECASE)
             for m in matches:
                 evt = SpiderFootEvent("WEB_ANALYTICS_ID",
@@ -216,6 +242,7 @@ class sfp_webanalytics(SpiderFootPlugin):
                 self.notifyListeners(evt)
 
             # Dropbox Domain Verification
+            # https://help.dropbox.com/teams-admins/admin/domain-insights-account-capture#verify
             matches = re.findall(r'dropbox-domain-verification=([a-z0-9]{12})$', eventData.strip(), re.IGNORECASE)
             for m in matches:
                 evt = SpiderFootEvent("WEB_ANALYTICS_ID",
@@ -224,6 +251,7 @@ class sfp_webanalytics(SpiderFootPlugin):
                 self.notifyListeners(evt)
 
             # Detectify Domain Verification
+            # https://support.detectify.com/customer/en/portal/articles/2836806-verification-with-dns-txt-
             matches = re.findall(r'detectify-verification=([a-f0-9]{32})$', eventData.strip(), re.IGNORECASE)
             for m in matches:
                 evt = SpiderFootEvent("WEB_ANALYTICS_ID",
@@ -232,7 +260,7 @@ class sfp_webanalytics(SpiderFootPlugin):
                 self.notifyListeners(evt)
 
             # Drift Domain Verification
-            matches = re.findall(r'detectify-verification=([a-f0-9]{64})$', eventData.strip(), re.IGNORECASE)
+            matches = re.findall(r'drift-verification=([a-f0-9]{64})$', eventData.strip(), re.IGNORECASE)
             for m in matches:
                 evt = SpiderFootEvent("WEB_ANALYTICS_ID",
                                       "Drift Domain Verification: " + m,
@@ -240,6 +268,7 @@ class sfp_webanalytics(SpiderFootPlugin):
                 self.notifyListeners(evt)
 
             # Ahrefs Site Verification
+            # https://help.ahrefs.com/en/articles/1431155-how-do-i-finish-crawling-my-website-faster-in-site-audit
             matches = re.findall(r'ahrefs-site-verification_([a-f0-9]{64})$', eventData.strip(), re.IGNORECASE)
             for m in matches:
                 evt = SpiderFootEvent("WEB_ANALYTICS_ID",
@@ -278,6 +307,15 @@ class sfp_webanalytics(SpiderFootPlugin):
             for m in matches:
                 evt = SpiderFootEvent("WEB_ANALYTICS_ID",
                                       "Yandex Domain Verification: " + m,
+                                      self.__name__, parentEvent)
+                self.notifyListeners(evt)
+
+            # Brave Ledger Verification
+            # https://support.brave.com/hc/en-us/articles/360021408352-How-do-I-verify-my-channel-
+            matches = re.findall(r'brave-ledger-verification=([a-z0-9]+)$', eventData.strip(), re.IGNORECASE)
+            for m in matches:
+                evt = SpiderFootEvent("WEB_ANALYTICS_ID",
+                                      "Brave Ledger Verification: " + m,
                                       self.__name__, parentEvent)
                 self.notifyListeners(evt)
 
