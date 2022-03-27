@@ -11,11 +11,19 @@
 # -------------------------------------------------------------------------------
 
 import string
-from sflib import SpiderFoot, SpiderFootPlugin, SpiderFootEvent
+
+from spiderfoot import SpiderFootEvent, SpiderFootPlugin
+
 
 class sfp_binstring(SpiderFootPlugin):
-    """Binary String Extractor:Footprint:Content Analysis:errorprone:Attempt to identify strings in binary content."""
 
+    meta = {
+        'name': "Binary String Extractor",
+        'summary': "Attempt to identify strings in binary content.",
+        'flags': ["errorprone"],
+        'useCases': ["Footprint"],
+        'categories': ["Content Analysis"]
+    }
 
     # Default options
     opts = {
@@ -24,8 +32,8 @@ class sfp_binstring(SpiderFootPlugin):
         'maxfilesize': 1000000,
         'usedict': True,
         'fileexts': ['png', 'gif', 'jpg', 'jpeg', 'tiff', 'tif',
-                    'ico', 'flv', 'mp4', 'mp3', 'avi', 'mpg',
-                    'mpeg', 'dat', 'mov', 'swf', 'exe', 'bin'],
+                     'ico', 'flv', 'mp4', 'mp3', 'avi', 'mpg',
+                     'mpeg', 'dat', 'mov', 'swf', 'exe', 'bin'],
         'filterchars': '#}{|%^&*()=+,;[]~'
     }
 
@@ -51,7 +59,7 @@ class sfp_binstring(SpiderFootPlugin):
 
         self.d = set(self.sf.dictwords())
 
-        for opt in userOpts.keys():
+        for opt in list(userOpts.keys()):
             self.opts[opt] = userOpts[opt]
 
     def getStrings(self, content):
@@ -62,6 +70,7 @@ class sfp_binstring(SpiderFootPlugin):
             return None
 
         for c in content:
+            c = str(c)
             if len(words) >= self.opts['maxwords']:
                 break
             if c in string.printable and c not in string.whitespace:
@@ -87,7 +96,7 @@ class sfp_binstring(SpiderFootPlugin):
 
                 if accept:
                     words.append(result)
-                    
+
                 result = ""
 
         if len(words) == 0:
@@ -96,13 +105,10 @@ class sfp_binstring(SpiderFootPlugin):
         return words
 
     # What events is this module interested in for input
-    # * = be notified about all events.
     def watchedEvents(self):
         return ["LINKED_URL_INTERNAL"]
 
     # What events this module produces
-    # This is to support the end user in selecting modules based on events
-    # produced.
     def producedEvents(self):
         return ["RAW_FILE_META_DATA"]
 
@@ -112,32 +118,32 @@ class sfp_binstring(SpiderFootPlugin):
         srcModuleName = event.module
         eventData = event.data
 
-        self.sf.debug("Received event, " + eventName + ", from " + srcModuleName)
+        self.debug(f"Received event, {eventName}, from {srcModuleName}")
 
         if eventData in self.results:
-            return None
-        else:
-            self.results.append(eventData)
+            return
 
-        # if the file matches any of the file extensions we are interested in
-        # then fetch the file and write it to aa temporary place
-        res = None
+        self.results.append(eventData)
+
         for fileExt in self.opts['fileexts']:
-            if eventData.lower().endswith("." + fileExt.lower()) or "." + fileExt + "?" in eventData.lower():
-                res = self.sf.fetchUrl(eventData, 
-                                       useragent=self.opts['_useragent'], 
-                                       dontMangle=True,
-                                       sizeLimit=self.opts['maxfilesize'])
-                
-        if res:
-            self.sf.debug("Searching for strings")
-            words = self.getStrings(res['content'])
+            if eventData.lower().endswith(f".{fileExt.lower()}") or f".{fileExt.lower()}?" in eventData.lower():
+                res = self.sf.fetchUrl(
+                    eventData,
+                    useragent=self.opts['_useragent'],
+                    disableContentEncoding=True,
+                    sizeLimit=self.opts['maxfilesize'],
+                    verify=False
+                )
 
-            if words:
-                wordstr = '\n'.join(words[0:self.opts['maxwords']])
+                if not res:
+                    continue
 
-                # Notify other modules of what you've found
-                evt = SpiderFootEvent("RAW_FILE_META_DATA", wordstr, self.__name__, event)
-                self.notifyListeners(evt)
+                self.debug(f"Searching {eventData} for strings")
+                words = self.getStrings(res['content'])
+
+                if words:
+                    wordstr = '\n'.join(words[0:self.opts['maxwords']])
+                    evt = SpiderFootEvent("RAW_FILE_META_DATA", wordstr, self.__name__, event)
+                    self.notifyListeners(evt)
 
 # End of sfp_binstring class

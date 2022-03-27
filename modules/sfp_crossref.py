@@ -14,89 +14,109 @@
 # -------------------------------------------------------------------------------
 
 import re
-from sflib import SpiderFoot, SpiderFootPlugin, SpiderFootEvent
+
+from spiderfoot import SpiderFootEvent, SpiderFootPlugin
 
 
 class sfp_crossref(SpiderFootPlugin):
-    """Cross-Reference:Footprint:Crawling and Scanning::Identify whether other domains are associated ('Affiliates') of the target."""
 
+    meta = {
+        'name': "Cross-Referencer",
+        'summary': "Identify whether other domains are associated ('Affiliates') of the target by looking for links back to the target site(s).",
+        'flags': [],
+        'useCases': ["Footprint"],
+        'categories': ["Crawling and Scanning"]
+    }
 
-    # Default options
     opts = {
         'checkbase': True
     }
 
-    # Option descriptions
     optdescs = {
         "checkbase": "Check the base URL of the potential affiliate if no direct affiliation found?"
     }
 
-    # Internal results tracking
-    results = dict()
-    fetched = list()
+    fetched = None
 
     def setup(self, sfc, userOpts=dict()):
         self.sf = sfc
-        self.results = dict()
-        self.fetched = list()
+        self.fetched = self.tempStorage()
 
-        for opt in userOpts.keys():
+        for opt in list(userOpts.keys()):
             self.opts[opt] = userOpts[opt]
 
-    # What events is this module interested in for input
     def watchedEvents(self):
-        return ['LINKED_URL_EXTERNAL', 'SIMILARDOMAIN', 
-                'CO_HOSTED_SITE', 'DARKNET_MENTION_URL']
+        return [
+            'LINKED_URL_EXTERNAL',
+            'SIMILARDOMAIN',
+            'CO_HOSTED_SITE',
+            'DARKNET_MENTION_URL'
+        ]
 
-    # What events this module produces
-    # This is to support the end user in selecting modules based on events
-    # produced.
     def producedEvents(self):
-        return ["AFFILIATE_INTERNET_NAME", "AFFILIATE_WEB_CONTENT"]
+        return [
+            'AFFILIATE_INTERNET_NAME',
+            'AFFILIATE_WEB_CONTENT'
+        ]
 
-    # Handle events sent to this module
-    # In this module's case, eventData will be the URL or a domain which
-    # was found in some content somewhere.
     def handleEvent(self, event):
         eventName = event.eventType
         srcModuleName = event.module
         eventData = event.data
 
-        self.sf.debug("Received event, " + eventName + ", from " + srcModuleName)
+        self.debug(f"Received event, {eventName}, from {srcModuleName}")
 
-        # The SIMILARDOMAIN and CO_HOSTED_SITE events supply domains, 
-        # not URLs. Assume HTTP.
+        # SIMILARDOMAIN and CO_HOSTED_SITE events are domains, not URLs.
+        # Assume HTTP.
         if eventName in ['SIMILARDOMAIN', 'CO_HOSTED_SITE']:
-            eventData = 'http://' + eventData.lower()
+            url = 'http://' + eventData.lower()
+        elif 'URL' in eventName:
+            url = eventData
+        else:
+            return
+
+        fqdn = self.sf.urlFQDN(url)
 
         # We are only interested in external sites for the crossref
-        if self.getTarget().matches(self.sf.urlFQDN(eventData)):
-            self.sf.debug("Ignoring " + eventData + " as not external")
-            return None
+        if self.getTarget().matches(fqdn):
+            self.debug(f"Ignoring {url} as not external")
+            return
 
         if eventData in self.fetched:
-            self.sf.debug("Ignoring " + eventData + " as already tested")
+            self.debug(f"Ignoring {url} as already tested")
             return
-        else:
-            self.fetched.append(eventData)
 
-        self.sf.debug("Testing for affiliation: " + eventData)
-        res = self.sf.fetchUrl(eventData, timeout=self.opts['_fetchtimeout'],
-                               useragent=self.opts['_useragent'])
+        if not self.sf.resolveHost(fqdn) and not self.sf.resolveHost6(fqdn):
+            self.debug(f"Ignoring {url} as {fqdn} does not resolve")
+            return
+
+        self.fetched[url] = True
+
+        self.debug(f"Testing URL for affiliation: {url}")
+
+        res = self.sf.fetchUrl(
+            url,
+            timeout=self.opts['_fetchtimeout'],
+            useragent=self.opts['_useragent'],
+            sizeLimit=10000000,
+            verify=False
+        )
 
         if res['content'] is None:
-            self.sf.debug("Ignoring " + eventData + " as no data returned")
-            return None
+            self.debug(f"Ignoring {url} as no data returned")
+            return
 
         matched = False
         for name in self.getTarget().getNames():
             # Search for mentions of our host/domain in the external site's data
-            pat = re.compile("([\.\'\/\"\ ]" + name + "[\.\'\/\"\ ])", re.IGNORECASE)
-            matches = re.findall(pat, res['content'])
+            pat = re.compile(
+                r"([\.\'\/\"\ ]" + re.escape(name) + r"[\.\'\/\"\ ])",
+                re.IGNORECASE
+            )
+            matches = re.findall(pat, str(res['content']))
 
             if len(matches) > 0:
                 matched = True
-                url = eventData
                 break
 
         if not matched:
@@ -106,32 +126,54 @@ class sfp_crossref(SpiderFootPlugin):
                 # Check the base url to see if there is an affiliation
                 url = self.sf.urlBaseUrl(eventData)
                 if url in self.fetched:
-                    return None
-                else:
-                    self.fetched.append(url)
+                    return
 
-                res = self.sf.fetchUrl(url, timeout=self.opts['_fetchtimeout'],
-                                       useragent=self.opts['_useragent'])
+                self.fetched[url] = True
+
+                res = self.sf.fetchUrl(
+                    url,
+                    timeout=self.opts['_fetchtimeout'],
+                    useragent=self.opts['_useragent'],
+                    sizeLimit=10000000,
+                    verify=False
+                )
+
                 if res['content'] is not None:
                     for name in self.getTarget().getNames():
-                        pat = re.compile("([\.\'\/\"\ ]" + name + "[\'\/\"\ ])",
-                                         re.IGNORECASE)
-                        matches = re.findall(pat, res['content'])
+                        pat = re.compile(
+                            r"([\.\'\/\"\ ]" + re.escape(name) + r"[\'\/\"\ ])",
+                            re.IGNORECASE
+                        )
+                        matches = re.findall(pat, str(res['content']))
 
                         if len(matches) > 0:
                             matched = True
+                            break
 
-        if matched:
-            if not event.moduleDataSource:
-                event.moduleDataSource = "Unknown"
-            self.sf.info("Found affiliate: " + url)
-            evt1 = SpiderFootEvent("AFFILIATE_INTERNET_NAME", self.sf.urlFQDN(url),
-                                   self.__name__, event)
-            evt1.moduleDataSource = event.moduleDataSource
-            self.notifyListeners(evt1)
-            evt2 = SpiderFootEvent("AFFILIATE_WEB_CONTENT", res['content'],
-                                   self.__name__, evt1)
-            evt2.moduleDataSource = event.moduleDataSource
-            self.notifyListeners(evt2)
+        if not matched:
+            return
+
+        if not event.moduleDataSource:
+            event.moduleDataSource = "Unknown"
+
+        self.info(f"Found link to target from affiliate: {url}")
+
+        evt1 = SpiderFootEvent(
+            "AFFILIATE_INTERNET_NAME",
+            self.sf.urlFQDN(url),
+            self.__name__,
+            event
+        )
+        evt1.moduleDataSource = event.moduleDataSource
+        self.notifyListeners(evt1)
+
+        evt2 = SpiderFootEvent(
+            "AFFILIATE_WEB_CONTENT",
+            res['content'],
+            self.__name__,
+            evt1
+        )
+        evt2.moduleDataSource = event.moduleDataSource
+        self.notifyListeners(evt2)
 
 # End of sfp_crossref class

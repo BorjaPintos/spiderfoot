@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # -------------------------------------------------------------------------------
 # Name:         sfp_isc
-# Purpose:      Checks if an ASN, IP or domain is malicious.
+# Purpose:      Check if an IP address is malicious according to SANS ISC.
 #
 # Author:       steve@binarypool.com
 #
@@ -10,247 +10,145 @@
 # Licence:     GPL
 # -------------------------------------------------------------------------------
 
-from netaddr import IPAddress, IPNetwork
 import re
-from sflib import SpiderFoot, SpiderFootPlugin, SpiderFootEvent
 
-malchecks = {
-    'Internet Storm Center': {
-        'id': '_isc',
-        'type': 'query',
-        'checks': ['ip'],
-        'url': 'https://isc.sans.edu/api/ip/{0}',
-        'badregex': ['.*<attacks>\d+</attacks>.*'],
-        'goodregex': []
-    }
-}
+from spiderfoot import SpiderFootEvent, SpiderFootPlugin
 
 
 class sfp_isc(SpiderFootPlugin):
-    """Internet Storm Center:Investigate,Passive:Reputation Systems::Check if an IP is malicious according to SANS ISC."""
 
+    meta = {
+        'name': "Internet Storm Center",
+        'summary': "Check if an IP address is malicious according to SANS ISC.",
+        'flags': [],
+        'useCases': ["Investigate", "Passive"],
+        'categories': ["Reputation Systems"],
+        'dataSource': {
+            'website': "https://isc.sans.edu",
+            'model': "FREE_NOAUTH_UNLIMITED",
+            'references': [
+                "https://isc.sans.edu/api/",
+                "https://isc.sans.edu/howto.html",
+                "https://isc.sans.edu/honeypot.html",
+                "https://isc.sans.edu/glossary.html",
+                "https://isc.sans.edu/fightback.html"
+            ],
+            'favIcon': "https://isc.sans.edu/iscfavicon.ico",
+            'logo': "https://isc.sans.edu/images/logos/isc/large.png",
+            'description': "The ISC provides a free analysis and warning service to thousands of Internet users "
+            "and organizations, and is actively working with Internet Service Providers to "
+            "fight back against the most malicious attackers.\n"
+            "Thousands of sensors that work with most firewalls, intrusion detection systems, "
+            "home broadband devices, and nearly all operating systems are constantly collecting information about "
+            "unwanted traffic arriving from the Internet. "
+            "These devices feed the DShield database where human volunteers as well as machines pour through "
+            "the data looking for abnormal trends and behavior. "
+            "The resulting analysis is posted to the ISC's main web page where it can be automatically retrieved "
+            "by simple scripts or can be viewed in near real time by any Internet user.",
+        }
+    }
 
-    # Default options
     opts = {
-        '_isc': True,
         'checkaffiliates': True
     }
 
-    # Option descriptions
     optdescs = {
         'checkaffiliates': "Apply checks to affiliates?"
     }
 
-    # Be sure to completely clear any class variables in setup()
-    # or you run the risk of data persisting between scan runs.
-
-    results = dict()
+    results = None
+    errorState = False
 
     def setup(self, sfc, userOpts=dict()):
         self.sf = sfc
-        self.results = dict()
+        self.results = self.tempStorage()
+        self.errorState = False
 
-        # Clear / reset any other class member variables here
-        # or you risk them persisting between threads.
-
-        for opt in userOpts.keys():
+        for opt in list(userOpts.keys()):
             self.opts[opt] = userOpts[opt]
 
-    # What events is this module interested in for input
-    # * = be notified about all events.
     def watchedEvents(self):
-        return ["IP_ADDRESS", "AFFILIATE_IPADDR" ]
+        return [
+            "IP_ADDRESS",
+            "IPV6_ADDRESS",
+            "AFFILIATE_IPADDR",
+            "AFFILIATE_IPV6_ADDRESS",
+        ]
 
-    # What events this module produces
-    # This is to support the end user in selecting modules based on events
-    # produced.
     def producedEvents(self):
-        return ["MALICIOUS_IPADDR", "MALICIOUS_AFFILIATE_IPADDR"]
+        return [
+            "BLACKLISTED_IPADDR",
+            "BLACKLISTED_AFFILIATE_IPADDR",
+            "MALICIOUS_IPADDR",
+            "MALICIOUS_AFFILIATE_IPADDR",
+        ]
 
-    # Check the regexps to see whether the content indicates maliciousness
-    def contentMalicious(self, content, goodregex, badregex):
-        # First, check for the bad indicators
-        if len(badregex) > 0:
-            for rx in badregex:
-                if re.match(rx, content, re.IGNORECASE | re.DOTALL):
-                    self.sf.debug("Found to be bad against bad regex: " + rx)
-                    return True
+    def query(self, ip):
+        if not ip:
+            return None
 
-        # Finally, check for good indicators
-        if len(goodregex) > 0:
-            for rx in goodregex:
-                if re.match(rx, content, re.IGNORECASE | re.DOTALL):
-                    self.sf.debug("Found to be good againt good regex: " + rx)
-                    return False
+        res = self.sf.fetchUrl(
+            f"https://isc.sans.edu/api/ip/{ip}",
+            timeout=self.opts['_fetchtimeout'],
+            useragent=self.opts['_useragent'],
+        )
 
-        # If nothing was matched, reply None
-        self.sf.debug("Neither good nor bad, unknown.")
-        return None
+        if res['code'] != "200":
+            self.error(f"Unexpected HTTP response code {res['code']} from ISC.")
+            self.errorState = True
+            return None
 
-    # Look up 'query' type sources
-    def resourceQuery(self, id, target, targetType):
-        self.sf.debug("Querying " + id + " for maliciousness of " + target)
-        for check in malchecks.keys():
-            cid = malchecks[check]['id']
-            if id == cid and malchecks[check]['type'] == "query":
-                url = unicode(malchecks[check]['url'])
-                res = self.sf.fetchUrl(url.format(target), timeout=30, useragent=self.opts['_useragent'])
-                if res['content'] is None:
-                    self.sf.error("Unable to fetch " + url.format(target), False)
-                    return None
-                if self.contentMalicious(res['content'],
-                                         malchecks[check]['goodregex'],
-                                         malchecks[check]['badregex']):
-                    return url.format(target)
+        if res['content'] is None:
+            self.error("Received no content from ISC")
+            self.errorState = True
+            return None
 
-        return None
+        return res['content']
 
-    # Look up 'list' type resources
-    def resourceList(self, id, target, targetType):
-        targetDom = ''
-        # Get the base domain if we're supplied a domain
-        if targetType == "domain":
-            targetDom = self.sf.hostDomain(target, self.opts['_internettlds'])
-
-        for check in malchecks.keys():
-            cid = malchecks[check]['id']
-            if id == cid and malchecks[check]['type'] == "list":
-                data = dict()
-                url = malchecks[check]['url']
-                data['content'] = self.sf.cacheGet("sfmal_" + cid, self.opts.get('cacheperiod', 0))
-                if data['content'] is None:
-                    data = self.sf.fetchUrl(url, timeout=30, useragent=self.opts['_useragent'])
-                    if data['content'] is None:
-                        self.sf.error("Unable to fetch " + url, False)
-                        return None
-                    else:
-                        self.sf.cachePut("sfmal_" + cid, data['content'])
-
-                # If we're looking at netblocks
-                if targetType == "netblock":
-                    iplist = list()
-                    # Get the regex, replace {0} with an IP address matcher to 
-                    # build a list of IP.
-                    # Cycle through each IP and check if it's in the netblock.
-                    if 'regex' in malchecks[check]:
-                        rx = malchecks[check]['regex'].replace("{0}",
-                                                               "(\d+\.\d+\.\d+\.\d+)")
-                        pat = re.compile(rx, re.IGNORECASE)
-                        self.sf.debug("New regex for " + check + ": " + rx)
-                        for line in data['content'].split('\n'):
-                            grp = re.findall(pat, line)
-                            if len(grp) > 0:
-                                #self.sf.debug("Adding " + grp[0] + " to list.")
-                                iplist.append(grp[0])
-                    else:
-                        iplist = data['content'].split('\n')
-
-                    for ip in iplist:
-                        if len(ip) < 8 or ip.startswith("#"):
-                            continue
-                        ip = ip.strip()
-
-                        try:
-                            if IPAddress(ip) in IPNetwork(target):
-                                self.sf.debug(ip + " found within netblock/subnet " +
-                                              target + " in " + check)
-                                return url
-                        except Exception as e:
-                            self.sf.debug("Error encountered parsing: " + str(e))
-                            continue
-
-                    return None
-
-                # If we're looking at hostnames/domains/IPs
-                if 'regex' not in malchecks[check]:
-                    for line in data['content'].split('\n'):
-                        if line == target or (targetType == "domain" and line == targetDom):
-                            self.sf.debug(target + "/" + targetDom + " found in " + check + " list.")
-                            return url
-                else:
-                    # Check for the domain and the hostname
-                    try:
-                        rxDom = unicode(malchecks[check]['regex']).format(targetDom)
-                        rxTgt = unicode(malchecks[check]['regex']).format(target)
-                        for line in data['content'].split('\n'):
-                            if (targetType == "domain" and re.match(rxDom, line, re.IGNORECASE)) or \
-                                    re.match(rxTgt, line, re.IGNORECASE):
-                                self.sf.debug(target + "/" + targetDom + " found in " + check + " list.")
-                                return url
-                    except BaseException as e:
-                        self.sf.debug("Error encountered parsing 2: " + str(e))
-                        continue
-
-        return None
-
-    def lookupItem(self, resourceId, itemType, target):
-        for check in malchecks.keys():
-            cid = malchecks[check]['id']
-            if cid == resourceId and itemType in malchecks[check]['checks']:
-                self.sf.debug("Checking maliciousness of " + target + " (" +
-                              itemType + ") with: " + cid)
-                if malchecks[check]['type'] == "query":
-                    return self.resourceQuery(cid, target, itemType)
-                if malchecks[check]['type'] == "list":
-                    return self.resourceList(cid, target, itemType)
-
-        return None
-
-    # Handle events sent to this module
     def handleEvent(self, event):
         eventName = event.eventType
-        srcModuleName = event.module
         eventData = event.data
 
-        self.sf.debug("Received event, " + eventName + ", from " + srcModuleName)
+        self.debug(f"Received event, {eventName}, from {event.module}")
 
         if eventData in self.results:
-            self.sf.debug("Skipping " + eventData + ", already checked.")
-            return None
+            self.debug(f"Skipping {eventData}, already checked.")
+            return
+
+        if self.errorState:
+            return
+
+        self.results[eventData] = True
+
+        if eventName in ['IP_ADDRESS', 'IPV6_ADDRESS']:
+            malicious_type = 'MALICIOUS_IPADDR'
+            blacklist_type = 'BLACKLISTED_IPADDR'
+        elif eventName in ['AFFILIATE_IPADDR', 'AFFILIATE_IPV6_ADDRESS']:
+            if not self.opts.get('checkaffiliates', False):
+                return
+            malicious_type = 'MALICIOUS_AFFILIATE_IPADDR'
+            blacklist_type = 'BLACKLISTED_AFFILIATE_IPADDR'
         else:
-            self.results[eventData] = True
+            self.debug(f"Unexpected event type {eventName}, skipping")
+            return
 
-        if eventName == 'CO_HOSTED_SITE' and not self.opts.get('checkcohosts', False):
-            return None
-        if eventName == 'AFFILIATE_IPADDR' \
-                and not self.opts.get('checkaffiliates', False):
-            return None
+        data = self.query(eventData)
 
-        for check in malchecks.keys():
-            cid = malchecks[check]['id']
-            # If the module is enabled..
-            if self.opts[cid]:
-                if eventName in ['IP_ADDRESS', 'AFFILIATE_IPADDR']:
-                    typeId = 'ip'
-                    if eventName == 'IP_ADDRESS':
-                        evtType = 'MALICIOUS_IPADDR'
-                    else:
-                        evtType = 'MALICIOUS_AFFILIATE_IPADDR'
+        if not data:
+            return
 
-                if eventName in ['BGP_AS_OWNER', 'BGP_AS_MEMBER']:
-                    typeId = 'asn'
-                    evtType = 'MALICIOUS_ASN'
+        attacks = re.findall(r"<attacks>([0-9]+)</attacks>", data)
 
-                if eventName in ['INTERNET_NAME', 'CO_HOSTED_SITE',
-                                 'AFFILIATE_INTERNET_NAME', ]:
-                    typeId = 'domain'
-                    if eventName == "INTERNET_NAME":
-                        evtType = "MALICIOUS_INTERNET_NAME"
-                    if eventName == 'AFFILIATE_INTERNET_NAME':
-                        evtType = 'MALICIOUS_AFFILIATE_INTERNET_NAME'
-                    if eventName == 'CO_HOSTED_SITE':
-                        evtType = 'MALICIOUS_COHOST'
+        if not attacks:
+            return
 
-                url = self.lookupItem(cid, typeId, eventData)
-                if self.checkForStop():
-                    return None
+        url = f"https://isc.sans.edu/api/ip/{eventData}"
+        text = f"Internet Storm Center [{eventData}]\n<SFURL>{url}</SFURL>"
 
-                # Notify other modules of what you've found
-                if url is not None:
-                    text = check + " [" + eventData + "]\n" + "<SFURL>" + url + "</SFURL>"
-                    evt = SpiderFootEvent(evtType, text, self.__name__, event)
-                    self.notifyListeners(evt)
+        evt = SpiderFootEvent(malicious_type, text, self.__name__, event)
+        self.notifyListeners(evt)
 
-        return None
+        evt = SpiderFootEvent(blacklist_type, text, self.__name__, event)
+        self.notifyListeners(evt)
 
 # End of sfp_isc class

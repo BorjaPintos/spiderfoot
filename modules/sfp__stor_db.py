@@ -11,11 +11,17 @@
 # Licence:     GPL
 # -------------------------------------------------------------------------------
 
-from sflib import SpiderFoot, SpiderFootPlugin
+from spiderfoot import SpiderFootPlugin
 
 
 class sfp__stor_db(SpiderFootPlugin):
-    """Storage::::Stores scan results into the back-end SpiderFoot database. You will need this."""
+
+    meta = {
+        'name': "Storage",
+        'summary': "Stores scan results into the back-end SpiderFoot database. You will need this."
+    }
+
+    _priority = 0
 
     # Default options
     opts = {
@@ -25,13 +31,13 @@ class sfp__stor_db(SpiderFootPlugin):
 
     # Option descriptions
     optdescs = {
-        'maxstorage': "Maximum bytes to store for any piece of information retreived (0 = unlimited.)"
+        'maxstorage': "Maximum bytes to store for any piece of information retrieved (0 = unlimited.)"
     }
 
     def setup(self, sfc, userOpts=dict()):
         self.sf = sfc
 
-        for opt in userOpts.keys():
+        for opt in list(userOpts.keys()):
             self.opts[opt] = userOpts[opt]
 
     # What events is this module interested in for input
@@ -43,16 +49,15 @@ class sfp__stor_db(SpiderFootPlugin):
     # Handle events sent to this module
     def handleEvent(self, sfEvent):
         if not self.opts['_store']:
-            return None
+            return
 
         if self.opts['maxstorage'] != 0:
             if len(sfEvent.data) > self.opts['maxstorage']:
-                self.sf.debug("Storing an event: " + sfEvent.eventType)
+                self.debug("Storing an event: " + sfEvent.eventType)
                 self.__sfdb__.scanEventStore(self.getScanId(), sfEvent, self.opts['maxstorage'])
-                return None
+                return
 
-        self.sf.debug("Storing an event: " + sfEvent.eventType)
+        self.debug("Storing an event: " + sfEvent.eventType)
         self.__sfdb__.scanEventStore(self.getScanId(), sfEvent)
-
 
 # End of sfp__stor_db class

@@ -11,19 +11,51 @@
 # Licence:     GPL
 # -------------------------------------------------------------------------------
 
+import datetime
 import json
 import time
-import datetime
-from sflib import SpiderFoot, SpiderFootPlugin, SpiderFootEvent
+
+from spiderfoot import SpiderFootEvent, SpiderFootPlugin
 
 
 class sfp_intelx(SpiderFootPlugin):
-    """IntelligenceX:Investigate,Passive:Search Engines:apikey:Obtain information from IntelligenceX about identified IP addresses, domains, e-mail addresses and phone numbers."""
+
+    meta = {
+        'name': "IntelligenceX",
+        'summary': "Obtain information from IntelligenceX about identified IP addresses, domains, e-mail addresses and phone numbers.",
+        'flags': ["apikey"],
+        'useCases': ["Investigate", "Passive"],
+        'categories': ["Search Engines"],
+        'dataSource': {
+            'website': "https://intelx.io/",
+            'model': "FREE_AUTH_LIMITED",
+            'references': [
+                "https://ginseg.com/wp-content/uploads/sites/2/2019/07/Manual-Intelligence-X-API.pdf",
+                "https://blog.intelx.io/2019/01/25/new-developer-tab/",
+                "https://github.com/IntelligenceX/SDK"
+            ],
+            'apiKeyInstructions': [
+                "Visit https://intelx.io/",
+                "Register a free account",
+                "Navigate to https://intelx.io/account?tab=developer",
+                "The API key is listed under 'Your API details'"
+            ],
+            'favIcon': "https://intelx.io/favicon/favicon-32x32.png",
+            'logo': "https://intelx.io/assets/img/IntelligenceX.svg",
+            'description': "Intelligence X is an independent European technology company founded in 2018 by Peter Kleissner. "
+            "Its mission is to develop and maintain the search engine and data archive.\n"
+            "The search works with selectors, i.e. specific search terms such as "
+            "email addresses, domains, URLs, IPs, CIDRs, Bitcoin addresses, IPFS hashes, etc.\n"
+            "It searches in places such as the darknet, document sharing platforms, whois data, public data leaks and others.\n"
+            "It keeps a historical data archive of results, "
+            "similar to how the Wayback Machine from archive.org stores historical copies of websites.",
+        }
+    }
 
     # Default options
     opts = {
-        "api_key": "9df61df0-84f7-4dc7-b34c-8ccfb8646ace",
-        "base_url": "public.intelx.io",
+        "api_key": "",
+        "base_url": "2.intelx.io",
         "checkcohosts": False,
         "checkaffiliates": False,
         'netblocklookup': False,
@@ -43,7 +75,7 @@ class sfp_intelx(SpiderFootPlugin):
         'maxnetblock': "If looking up owned netblocks, the maximum netblock size to look up all IPs within (CIDR value, 24 = /24, 16 = /16, etc.)",
         'subnetlookup': "Look up all IPs on subnets which your target is a part of?",
         'maxsubnet': "If looking up subnets, the maximum subnet size to look up all the IPs within (CIDR value, 24 = /24, 16 = /16, etc.)",
-        'maxage': "Maximum age (in days) of results to be considered valid."
+        'maxage': "Maximum age (in days) of results to be considered valid. 0 = unlimited."
     }
 
     # Be sure to completely clear any class variables in setup()
@@ -54,13 +86,13 @@ class sfp_intelx(SpiderFootPlugin):
 
     def setup(self, sfc, userOpts=dict()):
         self.sf = sfc
-        self.results = dict()
+        self.results = self.tempStorage()
         self.errorState = False
 
         # Clear / reset any other class member variables here
         # or you risk them persisting between threads.
 
-        for opt in userOpts.keys():
+        for opt in list(userOpts.keys()):
             self.opts[opt] = userOpts[opt]
 
     # What events is this module interested in for input
@@ -70,10 +102,12 @@ class sfp_intelx(SpiderFootPlugin):
 
     # What events this module produces
     def producedEvents(self):
-        return ["LEAKSITE_URL", "DARKNET_MENTION_URL"]
+        return ["LEAKSITE_URL", "DARKNET_MENTION_URL",
+                "INTERNET_NAME", "DOMAIN_NAME",
+                "EMAILADDR", "EMAILADDR_GENERIC"]
 
-    def query(self, qry):
-        ret = None
+    def query(self, qry, qtype):
+        retdata = list()
 
         headers = {
             "User-Agent": "SpiderFoot",
@@ -91,53 +125,66 @@ class sfp_intelx(SpiderFootPlugin):
             "sort": 4,
             "media": 0,
             "terminate": []
-        } 
+        }
 
-        url = 'https://' + self.opts['base_url']  + '/intelligent/search'
-        res = self.sf.fetchUrl(url, postData=json.dumps(payload), 
+        url = 'https://' + self.opts['base_url'] + '/' + qtype + '/search'
+        res = self.sf.fetchUrl(url, postData=json.dumps(payload),
                                headers=headers, timeout=self.opts['_fetchtimeout'])
 
         if res['content'] is None:
-            self.sf.info("No IntelligenceX info found for " + qry)
+            self.info("No IntelligenceX info found for " + qry)
+            return None
+
+        if res['code'] == "402":
+            self.info("IntelligenceX credits expired.")
+            self.errorState = True
             return None
 
         try:
             ret = json.loads(res['content'])
         except Exception as e:
-            self.sf.error("Error processing JSON response from IntelligenceX.", False)
+            self.error(f"Error processing JSON response from IntelligenceX: {e}")
             self.errorState = True
             return None
 
         if ret.get('status', -1) == 0:
-            #Craft API URL with the id to return results
-            resulturl = url + "/result?id=%s" % str(ret['id'])
+            # Craft API URL with the id to return results
+            resulturl = f"{url}/result?id={ret['id']}"
             limit = 30
             count = 0
             status = 3  # status 3 = No results yet, keep trying. 0 = Success with results
-            while status == 3 and count < limit:
+            while status in [3, 0] and count < limit:
+                if self.checkForStop():
+                    return None
+
                 res = self.sf.fetchUrl(resulturl, headers=headers)
                 if res['content'] is None:
-                    self.sf.info("No IntelligenceX info found for results from " + qry)
+                    self.info("No IntelligenceX info found for results from " + qry)
+                    return None
+
+                if res['code'] == "402":
+                    self.info("IntelligenceX credits expired.")
+                    self.errorState = True
                     return None
 
                 try:
                     ret = json.loads(res['content'])
                 except Exception as e:
-                    self.sf.error("Error processing JSON response from IntelligenceX.", False)
+                    self.error("Error processing JSON response from IntelligenceX: " + str(e))
                     return None
 
                 status = ret['status']
                 count += 1
 
-                if status in [0, 1]:
-                    #print data in json format to manipulate as desired
-                    self.sf.debug("Results found, returning")
-                    return ret
+                retdata.append(ret)
+                # No more results left
+                if status == 1:
+                    # print data in json format to manipulate as desired
+                    break
 
                 time.sleep(1)
-                
-        self.sf.debug("No results found.")
-        return None
+
+        return retdata
 
     # Handle events sent to this module
     def handleEvent(self, event):
@@ -146,59 +193,101 @@ class sfp_intelx(SpiderFootPlugin):
         eventData = event.data
 
         if self.errorState:
-            return None
+            return
 
         if self.opts['api_key'] == "" or self.opts['base_url'] == "":
-            self.sf.error("You enabled sfp_intelx but did not set an API key and/or base URL!", False)
+            self.error("You enabled sfp_intelx but did not set an API key and/or base URL!")
             self.errorState = True
-            return None
+            return
 
-        self.sf.debug("Received event, " + eventName + ", from " + srcModuleName)
+        self.debug(f"Received event, {eventName}, from {srcModuleName}")
 
-        # Don't look up stuff twice
         if eventData in self.results:
-            self.sf.debug("Skipping " + eventData + " as already mapped.")
-            return None
-        else:
-            self.results[eventData] = True
+            self.debug(f"Skipping {eventData}, already checked.")
+            return
+
+        self.results[eventData] = True
 
         if eventName.startswith("AFFILIATE") and not self.opts['checkaffiliates']:
-            return None
+            return
 
         if eventName == 'CO_HOSTED_SITE' and not self.opts['checkcohosts']:
-            return None
+            return
 
-        info = self.query(eventData)
-        if info is None:
-            return None
+        data = self.query(eventData, "intelligent")
+        if data is None:
+            return
 
-        self.sf.info("Found IntelligenceX URL data for " + eventData)
+        self.info("Found IntelligenceX leak data for " + eventData)
         agelimit = int(time.time() * 1000) - (86400000 * self.opts['maxage'])
-        for rec in info.get("records", dict()):
-            try:
-                last_seen = int(datetime.datetime.strptime(rec['added'].split(".")[0], '%Y-%m-%dT%H:%M:%S').strftime('%s')) * 1000
-                if last_seen < agelimit:                                                                                                                             
-                    self.sf.debug("Record found but too old, skipping.")
+        for info in data:
+            for rec in info.get("records", dict()):
+                try:
+                    last_seen = int(datetime.datetime.strptime(rec['added'].split(".")[0], '%Y-%m-%dT%H:%M:%S').strftime('%s')) * 1000
+                    if self.opts['maxage'] > 0 and last_seen < agelimit:
+                        self.debug("Record found but too old, skipping.")
+                        continue
+
+                    val = None
+                    evt = None
+                    if "pastes" in rec['bucket']:
+                        evt = "LEAKSITE_URL"
+                        val = rec['keyvalues'][0]['value']
+                    if rec['bucket'].startswith("darknet."):
+                        evt = "DARKNET_MENTION_URL"
+                        val = rec['name']
+
+                    if not val or not evt:
+                        # Try generically extracting it
+                        if "systemid" not in rec:
+                            continue
+                        evt = "LEAKSITE_URL"
+                        val = "https://intelx.io/?did=" + rec['systemid']
+                except Exception as e:
+                    self.error(f"Error processing content from IntelX: {e}")
                     continue
 
-                val = None
-                evt = None
-                if rec['bucket'] == "pastes":
-                    evt = "LEAKSITE_URL"
-                    val = rec['keyvalues'][0]['value']
-                if rec['bucket'].startswith("darknet."):
-                    evt = "DARKNET_MENTION_URL"
-                    val = rec['name']
+                # Notify other modules of what you've found
+                e = SpiderFootEvent(evt, val, self.__name__, event)
+                self.notifyListeners(e)
 
-                if not val or not evt:
-                    self.sf.debug("Unexpected record, skipping (" + str(rec['bucket'] + ")"))
+        if "public.intelx.io" in self.opts['base_url'] or eventName != "INTERNET_NAME":
+            return
+
+        data = self.query(eventData, "phonebook")
+        if data is None:
+            return
+
+        self.info(f"Found IntelligenceX host and email data for {eventData}")
+        for info in data:
+            for rec in info.get("selectors", dict()):
+                try:
+                    val = rec['selectorvalueh']
+                    evt = None
+                    if rec['selectortype'] == 1:  # Email
+                        evt = "EMAILADDR"
+                        if val.split("@")[0] in self.opts['_genericusers'].split(","):
+                            evt = "EMAILADDR_GENERIC"
+                    if rec['selectortype'] == 2:  # Domain
+                        evt = "INTERNET_NAME"
+                        if val == eventData:
+                            continue
+                    if rec['selectortype'] == 3:  # URL
+                        evt = "LINKED_URL_INTERNAL"
+
+                    if not val or not evt:
+                        self.debug("Unexpected record, skipping.")
+                        continue
+                except Exception as e:
+                    self.error(f"Error processing content from IntelX: {e}")
                     continue
-            except BaseException as e:
-                self.sf.error("Error processing content from IntelX: " + str(e), False)
-                continue
-                
-            # Notify other modules of what you've found
-            e = SpiderFootEvent(evt, val, self.__name__, event)
-            self.notifyListeners(e)
+
+                # Notify other modules of what you've found
+                e = SpiderFootEvent(evt, val, self.__name__, event)
+                self.notifyListeners(e)
+
+                if evt == "INTERNET_NAME" and self.sf.isDomain(val, self.opts['_internettlds']):
+                    e = SpiderFootEvent("DOMAIN_NAME", val, self.__name__, event)
+                    self.notifyListeners(e)
 
 # End of sfp_intelx class

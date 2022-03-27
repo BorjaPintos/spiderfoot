@@ -10,30 +10,32 @@
 # Licence:     GPL
 # -------------------------------------------------------------------------------
 
-try:
-    import re2 as re
-except ImportError:
-    import re
-from sflib import SpiderFoot, SpiderFootPlugin, SpiderFootEvent
+import re
+
+from spiderfoot import SpiderFootEvent, SpiderFootPlugin
 
 # Taken from Google Dorks on exploit-db.com
 regexps = dict({
     "PHP Error": ["PHP pase error", "PHP warning", "PHP error",
                   "unexpected T_VARIABLE", "warning: failed opening", "include_path="],
     "Generic Error": ["Internal Server Error", "Incorrect syntax"],
-    "Oracle Error": ["ORA-\d+", "TNS:.?no listen"],
+    "Oracle Error": [r"ORA-\d+", "TNS:.?no listen"],
     "ASP Error": ["NET_SessionId"],
-    "MySQL Error": ["mysql_query\(", "mysql_connect\("],
-    "ODBC Error": ["\[ODBC SQL"]
+    "MySQL Error": [r"mysql_query\(", r"mysql_connect\("],
+    "ODBC Error": [r"\[ODBC SQL"]
 
 })
 
 
 class sfp_errors(SpiderFootPlugin):
-    """Errors:Footprint:Content Analysis::Identify common error messages in content like SQL errors, etc."""
 
-
-
+    meta = {
+        'name': "Error String Extractor",
+        'summary': "Identify common error messages in content like SQL errors, etc.",
+        'flags': [],
+        'useCases': ["Footprint", "Passive"],
+        'categories': ["Content Analysis"]
+    }
 
     # Default options
     opts = {}
@@ -46,14 +48,14 @@ class sfp_errors(SpiderFootPlugin):
     }
 
     # Target
-    results = dict()
+    results = None
 
     def setup(self, sfc, userOpts=dict()):
         self.sf = sfc
-        self.results = dict()
+        self.results = self.tempStorage()
         self.__dataSource__ = "Target Website"
 
-        for opt in userOpts.keys():
+        for opt in list(userOpts.keys()):
             self.opts[opt] = userOpts[opt]
 
     # What events is this module interested in for input
@@ -75,20 +77,21 @@ class sfp_errors(SpiderFootPlugin):
 
         # We only want web content from the target
         if srcModuleName != "sfp_spider":
-            return None
+            return
 
-        eventSource = event.sourceEvent.data
-        self.sf.debug("Received event, " + eventName + ", from " + srcModuleName)
+        eventSource = event.actualSource
 
-        if eventSource not in self.results.keys():
+        self.debug(f"Received event, {eventName}, from {srcModuleName}")
+
+        if eventSource not in list(self.results.keys()):
             self.results[eventSource] = list()
 
         # We only want web content for pages on the target site
         if not self.getTarget().matches(self.sf.urlFQDN(eventSource)):
-            self.sf.debug("Not collecting web content information for external sites.")
-            return None
+            self.debug("Not collecting web content information for external sites.")
+            return
 
-        for regexpGrp in regexps.keys():
+        for regexpGrp in list(regexps.keys()):
             if regexpGrp in self.results[eventSource]:
                 continue
 
@@ -96,17 +99,10 @@ class sfp_errors(SpiderFootPlugin):
                 pat = re.compile(regex, re.IGNORECASE)
                 matches = re.findall(pat, eventData)
                 if len(matches) > 0 and regexpGrp not in self.results[eventSource]:
-                    self.sf.info("Matched " + regexpGrp + " in content from " + eventSource)
-                    self.results[eventSource].append(regexpGrp)
+                    self.info("Matched " + regexpGrp + " in content from " + eventSource)
+                    self.results[eventSource] = self.results[eventSource] + [regexpGrp]
                     evt = SpiderFootEvent("ERROR_MESSAGE", regexpGrp,
-                                          self.__name__, event.sourceEvent)
+                                          self.__name__, event)
                     self.notifyListeners(evt)
-
-        return None
-
-    # If you intend for this module to act on its own (e.g. not solely rely
-    # on events from other modules, then you need to have a start() method
-    # and within that method call self.checkForStop() to see if you've been
-    # politely asked by the controller to stop your activities (user abort.)
 
 # End of sfp_errors class

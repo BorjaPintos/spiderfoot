@@ -11,15 +11,29 @@
 # Licence:     GPL
 # -------------------------------------------------------------------------------
 
-from subprocess import Popen, PIPE
 import io
 import json
 import os.path
-from sflib import SpiderFoot, SpiderFootPlugin, SpiderFootEvent
+from subprocess import PIPE, Popen
+
+from spiderfoot import SpiderFootEvent, SpiderFootPlugin, SpiderFootHelpers
+
 
 class sfp_tool_cmseek(SpiderFootPlugin):
-    """Tool - CMSeeK:Footprint,Investigate:Content Analysis:tool:Identify what Content Management System (CMS) might be used."""
 
+    meta = {
+        'name': "Tool - CMSeeK",
+        'summary': "Identify what Content Management System (CMS) might be used.",
+        'flags': ["tool"],
+        'useCases': ["Footprint", "Investigate"],
+        'categories': ["Content Analysis"],
+        'toolDetails': {
+            'name': "CMSeeK",
+            'description': "CMSeek is a tool that is used to extract Content Management System(CMS) details of a website.",
+            'website': 'https://github.com/Tuhinshubhra/CMSeeK',
+            'repository': 'https://github.com/Tuhinshubhra/CMSeeK'
+        },
+    }
 
     # Default options
     opts = {
@@ -38,11 +52,11 @@ class sfp_tool_cmseek(SpiderFootPlugin):
 
     def setup(self, sfc, userOpts=dict()):
         self.sf = sfc
-        self.results = dict()
+        self.results = self.tempStorage()
         self.errorState = False
         self.__dataSource__ = "Target Website"
 
-        for opt in userOpts.keys():
+        for opt in list(userOpts.keys()):
             self.opts[opt] = userOpts[opt]
 
     # What events is this module interested in for input
@@ -61,22 +75,21 @@ class sfp_tool_cmseek(SpiderFootPlugin):
         srcModuleName = event.module
         eventData = event.data
 
-        self.sf.debug("Received event, " + eventName + ", from " + srcModuleName)
+        self.debug(f"Received event, {eventName}, from {srcModuleName}")
 
         if self.errorState:
-            return None
+            return
 
-        # Don't look up stuff twice, check IP == IP here
         if eventData in self.results:
-            self.sf.debug("Skipping " + eventData + " as already scanned.")
-            return None
-        else:
-            self.results[eventData] = True
+            self.debug(f"Skipping {eventData} as already scanned.")
+            return
+
+        self.results[eventData] = True
 
         if not self.opts['cmseekpath']:
-            self.sf.error("You enabled sfp_tool_cmseek but did not set a path to the tool!", False)
+            self.error("You enabled sfp_tool_cmseek but did not set a path to the tool!")
             self.errorState = True
-            return None
+            return
 
         # Normalize path
         if self.opts['cmseekpath'].endswith('cmseek.py'):
@@ -91,40 +104,63 @@ class sfp_tool_cmseek(SpiderFootPlugin):
 
         # If tool is not found, abort
         if not os.path.isfile(exe):
-            self.sf.error("File does not exist: " + exe, False)
+            self.error(f"File does not exist: {exe}")
             self.errorState = True
-            return None
+            return
 
         # Sanitize domain name.
-        if not self.sf.sanitiseInput(eventData):
-            self.sf.error("Invalid input, refusing to run.", False)
-            return None
+        if not SpiderFootHelpers.sanitiseInput(eventData):
+            self.error("Invalid input, refusing to run.")
+            return
+
+        args = [
+            self.opts['pythonpath'],
+            exe,
+            '--follow-redirect',
+            '--batch',
+            '-u',
+            eventData
+        ]
+        try:
+            p = Popen(args, stdout=PIPE, stderr=PIPE)
+            stdout, stderr = p.communicate(input=None)
+        except Exception as e:
+            self.error(f"Unable to run CMSeeK: {e}")
+            return
+
+        if p.returncode != 0:
+            self.error(f"Unable to read CMSeeK output\nstderr: {stderr}\nstdout: {stdout}")
+            return
+
+        if b"CMS Detection failed" in stdout:
+            self.debug(f"Could not detect the CMS for {eventData}")
+            return
+
+        log_path = f"{resultpath}/{eventData}/cms.json"
+        if not os.path.isfile(log_path):
+            self.error(f"File does not exist: {log_path}")
+            return
 
         try:
-            p = Popen([self.opts['pythonpath'], exe, "--follow-redirect", "-u", eventData], stdout=PIPE, stderr=PIPE)
-            stdout, stderr = p.communicate(input=None)
-            if p.returncode == 0:
-                content = stdout
-            else:
-                self.sf.error("Unable to read CMSeeK content.", False)
-                self.sf.debug("Error running CMSeeK: " + stderr + ", " + stdout)
-                return None
+            f = io.open(log_path, encoding='utf-8')
+            j = json.loads(f.read())
+        except Exception as e:
+            self.error(f"Could not parse CMSeeK output file {log_path} as JSON: {e}")
+            return
 
-            if "CMS Detection failed" in content:
-                self.sf.debug("Couldn't detect the CMS for " + eventData)
-                return None
+        cms_name = j.get('cms_name')
 
-            try:
-                f = io.open(resultpath + "/" + eventData + "/cms.json", encoding='utf-8')
-                j = json.loads(f.read())
-                evt = SpiderFootEvent("WEBSERVER_TECHNOLOGY", j['cms_name'],
-                                       self.__name__, event)
-                self.notifyListeners(evt)
-            except BaseException as e:
-                self.sf.error("Couldn't parse the JSON output of CMSeeK: " + str(e), False)
-                return None
-        except BaseException as e:
-            self.sf.error("Unable to run CMSeeK: " + str(e), False)
-            return None
+        if not cms_name:
+            return
+
+        cms_version = j.get('cms_version')
+
+        software = ' '.join(filter(None, [cms_name, cms_version]))
+
+        if not software:
+            return
+
+        evt = SpiderFootEvent("WEBSERVER_TECHNOLOGY", software, self.__name__, event)
+        self.notifyListeners(evt)
 
 # End of sfp_tool_cmseek class

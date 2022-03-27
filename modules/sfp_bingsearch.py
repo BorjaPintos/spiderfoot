@@ -9,11 +9,35 @@
 # Copyright:   (c) Steve Micallef 2013
 # Licence:     GPL
 # -------------------------------------------------------------------------------
-from sflib import SpiderFoot, SpiderFootPlugin, SpiderFootEvent
+from spiderfoot import SpiderFootEvent, SpiderFootPlugin
 
 
 class sfp_bingsearch(SpiderFootPlugin):
-    """Bing:Footprint,Investigate,Passive:Search Engines:apikey:Obtain information from bing to identify sub-domains and links."""
+
+    meta = {
+        'name': "Bing",
+        'summary': "Obtain information from bing to identify sub-domains and links.",
+        'flags': ["apikey"],
+        'useCases': ["Footprint", "Investigate", "Passive"],
+        'categories': ["Search Engines"],
+        'dataSource': {
+            'website': "https://www.bing.com/",
+            'model': "FREE_AUTH_LIMITED",
+            'references': [
+                "https://docs.microsoft.com/en-us/azure/cognitive-services/bing-web-search/"
+            ],
+            'apiKeyInstructions': [
+                "Visit https://azure.microsoft.com/en-in/services/cognitive-services/bing-web-search-api/",
+                "Register a free account",
+                "Select on Bing Custom Search",
+                "The API keys are listed under 'Key1' and 'Key2' (both should work)"
+            ],
+            'favIcon': "https://www.bing.com/sa/simg/bing_p_rr_teal_min.ico",
+            'logo': "https://www.bing.com/sa/simg/bing_p_rr_teal_min.ico",
+            'description': "The Bing Search APIs let you build web-connected apps and services that "
+            "find webpages, images, news, locations, and more without advertisements.",
+        }
+    }
 
     # Default options
     opts = {
@@ -35,7 +59,7 @@ class sfp_bingsearch(SpiderFootPlugin):
         self.results = self.tempStorage()
         self.errorState = False
 
-        for opt in userOpts.keys():
+        for opt in list(userOpts.keys()):
             self.opts[opt] = userOpts[opt]
 
     # What events is this module interested in for input
@@ -54,20 +78,20 @@ class sfp_bingsearch(SpiderFootPlugin):
         eventData = event.data
 
         if self.errorState:
-            return None
+            return
 
-        self.sf.debug("Received event, " + eventName + ", from " + srcModuleName)
+        self.debug(f"Received event, {eventName}, from {srcModuleName}")
 
         if self.opts['api_key'] == "":
-            self.sf.error("You enabled sfp_bingsearch but did not set a Bing API key!", False)
+            self.error("You enabled sfp_bingsearch but did not set a Bing API key!")
             self.errorState = True
-            return None
+            return
 
         if eventData in self.results:
-            self.sf.debug("Already did a search for " + eventData + ", skipping.")
-            return None
-        else:
-            self.results[eventData] = True
+            self.debug("Already did a search for " + eventData + ", skipping.")
+            return
+
+        self.results[eventData] = True
 
         # Sites hosted on the domain
 
@@ -82,20 +106,20 @@ class sfp_bingsearch(SpiderFootPlugin):
         )
         if res is None:
             # Failed to talk to the bing API or no results returned
-            return None
+            return
 
         urls = res["urls"]
         new_links = list(set(urls) - set(self.results.keys()))
 
         # Add new links to results
-        for l in new_links:
-            self.results[l] = True
+        for link in new_links:
+            self.results[link] = True
 
         internal_links = [
             link for link in new_links if self.sf.urlFQDN(link).endswith(eventData)
         ]
         for link in internal_links:
-            self.sf.debug("Found a link: " + link)
+            self.debug("Found a link: " + link)
 
             evt = SpiderFootEvent("LINKED_URL_INTERNAL", link, self.__name__, event)
             self.notifyListeners(evt)
@@ -105,7 +129,5 @@ class sfp_bingsearch(SpiderFootPlugin):
                 "RAW_RIR_DATA", str(res), self.__name__, event
             )
             self.notifyListeners(evt)
-
-
 
 # End of sfp_bingsearch class

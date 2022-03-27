@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # -------------------------------------------------------------------------------
 # Name:         sfp_arin
-# Purpose:      Queries the ARIN internet registry to get netblocks and other 
+# Purpose:      Queries the ARIN internet registry to get netblocks and other
 #               bits of info.
 #
 # Author:      Steve Micallef <steve@binarypool.com>
@@ -12,28 +12,55 @@
 # -------------------------------------------------------------------------------
 
 import json
-from sflib import SpiderFoot, SpiderFootPlugin, SpiderFootEvent
+
+from spiderfoot import SpiderFootEvent, SpiderFootPlugin
 
 
 class sfp_arin(SpiderFootPlugin):
-    """ARIN:Footprint,Investigate,Passive:Public Registries::Queries ARIN registry for contact information."""
 
+    meta = {
+        'name': "ARIN",
+        'summary': "Queries ARIN registry for contact information.",
+        'flags': [],
+        'useCases': ["Footprint", "Investigate", "Passive"],
+        'categories': ["Public Registries"],
+        'dataSource': {
+            'website': "https://www.arin.net/",
+            'model': "FREE_NOAUTH_UNLIMITED",
+            'references': [
+                "https://www.arin.net/resources/",
+                "https://www.arin.net/reference/",
+                "https://www.arin.net/participate/",
+                "https://www.arin.net/resources/guide/request/",
+                "https://www.arin.net/resources/registry/transfers/",
+                "https://www.arin.net/resources/guide/ipv6/"
+            ],
+            'favIcon': "https://www.arin.net/img/favicon.ico",
+            'logo': "https://www.arin.net/img/logo-stnd.svg",
+            'description': "ARIN is a nonprofit, member-based organization that administers IP addresses & "
+            "ASNs in support of the operation and growth of the Internet.\n"
+            "Established in December 1997 as a Regional Internet Registry, "
+            "the American Registry for Internet Numbers (ARIN) is responsible for the management "
+            "and distribution of Internet number resources such as Internet Protocol (IP) addresses "
+            "and Autonomous System Numbers (ASNs). ARIN manages these resources within its service region, "
+            "which is comprised of Canada, the United States, and many Caribbean and North Atlantic islands.",
+        }
+    }
 
     # Default options
     opts = {}
+    optdescs = {}
 
-    results = dict()
+    results = None
     currentEventSrc = None
-    memCache = dict()
     keywords = None
 
     def setup(self, sfc, userOpts=dict()):
         self.sf = sfc
-        self.results = dict()
-        self.memCache = dict()
+        self.results = self.tempStorage()
         self.currentEventSrc = None
 
-        for opt in userOpts.keys():
+        for opt in list(userOpts.keys()):
             self.opts[opt] = userOpts[opt]
 
     # What events is this module interested in for input
@@ -48,22 +75,15 @@ class sfp_arin(SpiderFootPlugin):
 
     # Fetch content and notify of the raw data
     def fetchRir(self, url):
-        if url in self.memCache:
-            res = self.memCache[url]
-        else:
-            head = { "Accept": "application/json" }
-            res = self.sf.fetchUrl(url, timeout=self.opts['_fetchtimeout'],
-                                   useragent=self.opts['_useragent'], headers=head)
-            if res['content'] is not None:
-                self.memCache[url] = res
-                evt = SpiderFootEvent("RAW_RIR_DATA", res['content'], self.__name__,
-                                      self.currentEventSrc)
-                self.notifyListeners(evt)
-        return res
+        head = {"Accept": "application/json"}
+        res = self.sf.fetchUrl(url, timeout=self.opts['_fetchtimeout'],
+                               useragent=self.opts['_useragent'], headers=head)
+        if res['content'] is not None and res['code'] != "404":
+            return res
+        return None
 
     # Owner information about an AS
     def query(self, qtype, value):
-        ownerinfo = dict()
         url = "https://whois.arin.net/rest/"
 
         if qtype == "domain":
@@ -77,24 +97,27 @@ class sfp_arin(SpiderFootPlugin):
                     fname = lname
                     lname = t
                 url += "pocs;first=" + fname + ";last=" + lname
-        except BaseException as e:
-            self.sf.debug("Couldn't process name: " + value + " (" + str(e) + ")")
+        except Exception as e:
+            self.debug("Couldn't process name: " + value + " (" + str(e) + ")")
             return None
 
         if qtype == "contact":
             url = value
 
         res = self.fetchRir(url)
-        if res['content'] is None:
-            self.sf.debug("No info found/available for " + value + " at ARIN.")
+        if not res:
+            self.debug("No info found/available for " + value + " at ARIN.")
             return None
 
         try:
-            j = json.loads(res['content'])
-            return j
+            data = json.loads(res['content'])
         except Exception as e:
-            self.sf.debug("Error processing JSON response.")
+            self.debug(f"Error processing JSON response: {e}")
             return None
+
+        evt = SpiderFootEvent("RAW_RIR_DATA", str(data), self.__name__, self.currentEventSrc)
+        self.notifyListeners(evt)
+        return data
 
     # Handle events sent to this module
     def handleEvent(self, event):
@@ -103,19 +126,19 @@ class sfp_arin(SpiderFootPlugin):
         eventData = event.data
         self.currentEventSrc = event
 
-        self.sf.debug("Received event, " + eventName + ", from " + srcModuleName)
+        self.debug(f"Received event, {eventName}, from {srcModuleName}")
 
         # Don't look up stuff twice
         if eventData in self.results:
-            self.sf.debug("Skipping " + eventData + " as already mapped.")
-            return None
-        else:
-            self.results[eventData] = True
+            self.debug(f"Skipping {eventData}, already checked.")
+            return
+
+        self.results[eventData] = True
 
         if eventName == "DOMAIN_NAME":
             ret = self.query("domain", eventData)
             if not ret:
-                return None
+                return
             if "pocs" in ret:
                 if "pocRef" in ret['pocs']:
                     ref = list()
@@ -134,7 +157,7 @@ class sfp_arin(SpiderFootPlugin):
                         # the names are separated in the content and sfp_names
                         # won't recognise it. So we submit this and see if it
                         # really is considered a name.
-                        evt = SpiderFootEvent("RAW_RIR_DATA", "Possible full name: " + name, 
+                        evt = SpiderFootEvent("RAW_RIR_DATA", "Possible full name: " + name,
                                               self.__name__, self.currentEventSrc)
                         self.notifyListeners(evt)
 
@@ -145,7 +168,7 @@ class sfp_arin(SpiderFootPlugin):
         if eventName == "HUMAN_NAME":
             ret = self.query("name", eventData)
             if not ret:
-                return None
+                return
             if "pocs" in ret:
                 if "pocRef" in ret['pocs']:
                     ref = list()
@@ -158,5 +181,5 @@ class sfp_arin(SpiderFootPlugin):
                         # We just want the raw data so we can get potential
                         # e-mail addresses.
                         self.query("contact", p['$'])
-                        
+
 # End of sfp_arin class

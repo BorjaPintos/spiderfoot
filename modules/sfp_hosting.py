@@ -12,12 +12,19 @@
 # -------------------------------------------------------------------------------
 
 from netaddr import IPAddress
-from sflib import SpiderFoot, SpiderFootPlugin, SpiderFootEvent
+
+from spiderfoot import SpiderFootEvent, SpiderFootPlugin
 
 
 class sfp_hosting(SpiderFootPlugin):
-    """Hosting Providers:Footprint,Investigate,Passive:Crawling and Scanning::Find out if any IP addresses identified fall within known 3rd party hosting ranges, e.g. Amazon, Azure, etc."""
 
+    meta = {
+        'name': "Hosting Provider Identifier",
+        'summary': "Find out if any IP addresses identified fall within known 3rd party hosting ranges, e.g. Amazon, Azure, etc.",
+        'flags': [],
+        'useCases': ["Footprint", "Investigate", "Passive"],
+        'categories': ["Content Analysis"]
+    }
 
     # Default options
     opts = {
@@ -28,14 +35,14 @@ class sfp_hosting(SpiderFootPlugin):
     }
 
     # Target
-    results = dict()
+    results = None
 
     def setup(self, sfc, userOpts=dict()):
         self.sf = sfc
-        self.results = dict()
+        self.results = self.tempStorage()
         self.__dataSource__ = "DNS"
 
-        for opt in userOpts.keys():
+        for opt in list(userOpts.keys()):
             self.opts[opt] = userOpts[opt]
 
     # What events is this module interested in for input
@@ -56,7 +63,7 @@ class sfp_hosting(SpiderFootPlugin):
         if data['content'] is None:
             data = self.sf.fetchUrl(url, useragent=self.opts['_useragent'])
             if data['content'] is None:
-                self.sf.error("Unable to fetch " + url, False)
+                self.error("Unable to fetch " + url)
                 return None
             else:
                 self.sf.cachePut("sfipcat", data['content'])
@@ -65,15 +72,15 @@ class sfp_hosting(SpiderFootPlugin):
             if "," not in line:
                 continue
             try:
-                [start,end,title,url] = line.split(",")
-            except BaseException as e:
+                [start, end, title, url] = line.split(",")
+            except Exception:
                 continue
 
             try:
                 if IPAddress(qaddr) > IPAddress(start) and IPAddress(qaddr) < IPAddress(end):
                     return [title, url]
-            except BaseException as e:
-                self.sf.debug("Encountered an issue processing an IP: " + str(e))
+            except Exception as e:
+                self.debug("Encountered an issue processing an IP: " + str(e))
                 continue
 
         return None
@@ -84,10 +91,11 @@ class sfp_hosting(SpiderFootPlugin):
         srcModuleName = event.module
         eventData = event.data
 
-        self.sf.debug("Received event, " + eventName + ", from " + srcModuleName)
+        self.debug(f"Received event, {eventName}, from {srcModuleName}")
 
         if eventData in self.results:
-            return None
+            return
+
         self.results[eventData] = True
 
         ret = self.queryAddr(eventData)

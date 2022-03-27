@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 # -------------------------------------------------------------------------------
-# Name:         sfp_abusech
-# Purpose:      Checks if an ASN, IP or domain is malicious.
+# Name:        sfp_abusech
+# Purpose:     Check if a host/domain, IP address or netblock is malicious according
+#              to Abuse.ch.
 #
 # Author:       steve@binarypool.com
 #
@@ -11,64 +12,51 @@
 # -------------------------------------------------------------------------------
 
 from netaddr import IPAddress, IPNetwork
-import re
-from sflib import SpiderFoot, SpiderFootPlugin, SpiderFootEvent
 
-malchecks = {
-    'abuse.ch Zeus Tracker (Domain)': {
-        'id': 'abusezeusdomain',
-        'type': 'list',
-        'checks': ['domain'],
-        'url': 'https://zeustracker.abuse.ch/blocklist.php?download=baddomains'
-    },
-    'abuse.ch Zeus Tracker (IP)': {
-        'id': 'abusezeusip',
-        'type': 'list',
-        'checks': ['ip', 'netblock'],
-        'url': 'https://zeustracker.abuse.ch/blocklist.php?download=badips'
-    },
-    'abuse.ch Feodo Tracker (IP)': {
-        'id': 'abusefeodoip',
-        'type': 'list',
-        'checks': ['ip', 'netblock'],
-        'url': 'https://feodotracker.abuse.ch/downloads/ipblocklist.txt'
-    },
-    'abuse.ch SSL Blacklist (IP)': {
-        'id': 'abusesslblip',
-        'type': 'list',
-        'checks': ['ip', 'netblock'],
-        'url': 'https://sslbl.abuse.ch/blacklist/sslipblacklist.csv',
-        'regex': '{0},.*'
-    },
-    'abuse.ch URLhaus (Domain)': {
-        'id': 'abuseurlhaus',
-        'type': 'list',
-        'checks': ['domain'],
-        'url': 'https://urlhaus.abuse.ch/downloads/csv/',
-        'regex': '.*//{0}/.*'
-    },
-    'abuse.ch Ransomware Blocklist (Domain)': {
-        'id': 'abuseransomdom',
-        'type': 'list',
-        'checks': ['domain'],
-        'url': 'https://ransomwaretracker.abuse.ch/downloads/RW_DOMBL.txt',
-        'regex': '^{0}$'
-    }
-}
+from spiderfoot import SpiderFootEvent, SpiderFootPlugin
+
 
 class sfp_abusech(SpiderFootPlugin):
-    """abuse.ch:Investigate,Passive:Reputation Systems::Check if a host/domain, IP or netblock is malicious according to abuse.ch."""
 
+    meta = {
+        'name': "abuse.ch",
+        'summary': "Check if a host/domain, IP address or netblock is malicious according to Abuse.ch.",
+        'flags': [],
+        'useCases': ["Passive", "Investigate"],
+        'categories': ["Reputation Systems"],
+        'dataSource': {
+            'website': "https://www.abuse.ch",
+            'model': "FREE_AUTH_UNLIMITED",
+            'references': [
+                "https://feodotracker.abuse.ch/",
+                "https://sslbl.abuse.ch/",
+                "https://urlhaus.abuse.ch/",
+            ],
+            'apiKeyInstructions': [
+                "Visit https://bazaar.abuse.ch/api#api_key",
+                "Login using a Twitter Account",
+                "Navigate to 'Account Settings'",
+                "The API key is listed under 'Your API Key'",
+                "Visit https://urlhaus.abuse.ch/api/",
+                "Login using a Twitter Account at https://urlhaus.abuse.ch/login/",
+                "Navigate to https://urlhaus.abuse.ch/api/#account",
+                "The API Key is listed under 'API-Key'"
+            ],
+            'favIcon': "https://abuse.ch/favicon.ico",
+            'logo': "https://abuse.ch/images/abusech.svg",
+            'description': "abuse.ch is operated by a random swiss guy fighting malware for non-profit, "
+            "running a couple of projects helping internet service providers and "
+            "network operators protecting their infrastructure from malware.\n"
+            "IT-Security researchers, vendors and law enforcement agencies rely on data from abuse.ch,"
+            "trying to make the internet a safer place.",
+        }
+    }
 
     # Default options
     opts = {
-        'abusezeusdomain': True,
-        'abusezeusip': True,
-        'abusefeododomain': True,
         'abusefeodoip': True,
         'abusesslblip': True,
         'abuseurlhaus': True,
-        'abuseransomdom': True,
         'checkaffiliates': True,
         'checkcohosts': True,
         'cacheperiod': 18,
@@ -78,13 +66,9 @@ class sfp_abusech(SpiderFootPlugin):
 
     # Option descriptions
     optdescs = {
-        'abusezeusdomain': "Enable abuse.ch Zeus domain check?",
-        'abusezeusip': "Enable abuse.ch Zeus IP check?",
-        'abusefeododomain': "Enable abuse.ch Feodo domain check?",
         'abusefeodoip': "Enable abuse.ch Feodo IP check?",
         'abusesslblip': "Enable abuse.ch SSL Backlist IP check?",
         'abuseurlhaus': "Enable abuse.ch URLhaus check?",
-        'abuseransomdom': "Enable abuse.ch Ransom Domains check?",
         'checkaffiliates': "Apply checks to affiliates?",
         'checkcohosts': "Apply checks to sites found to be co-hosted on the target's IP?",
         'cacheperiod': "Hours to cache list data before re-fetching.",
@@ -92,231 +76,340 @@ class sfp_abusech(SpiderFootPlugin):
         'checksubnets': "Check if any malicious IPs are found within the same subnet of the target?"
     }
 
-    # Be sure to completely clear any class variables in setup()
-    # or you run the risk of data persisting between scan runs.
-
-    results = dict()
+    results = None
+    errorState = False
 
     def setup(self, sfc, userOpts=dict()):
         self.sf = sfc
-        self.results = dict()
+        self.results = self.tempStorage()
+        self.errorState = False
 
-        # Clear / reset any other class member variables here
-        # or you risk them persisting between threads.
-
-        for opt in userOpts.keys():
+        for opt in list(userOpts.keys()):
             self.opts[opt] = userOpts[opt]
 
     # What events is this module interested in for input
-    # * = be notified about all events.
     def watchedEvents(self):
-        return ["INTERNET_NAME", "IP_ADDRESS",
-                "NETBLOCK_MEMBER", "AFFILIATE_INTERNET_NAME", "AFFILIATE_IPADDR",
-                "CO_HOSTED_SITE", "NETBLOCK_OWNER"]
+        return [
+            "INTERNET_NAME",
+            "IP_ADDRESS",
+            "NETBLOCK_MEMBER",
+            "AFFILIATE_INTERNET_NAME",
+            "AFFILIATE_IPADDR",
+            "CO_HOSTED_SITE",
+            "NETBLOCK_OWNER"
+        ]
 
     # What events this module produces
-    # This is to support the end user in selecting modules based on events
-    # produced.
     def producedEvents(self):
-        return ["MALICIOUS_IPADDR", "MALICIOUS_INTERNET_NAME",
-                "MALICIOUS_AFFILIATE_IPADDR", "MALICIOUS_AFFILIATE_INTERNET_NAME",
-                "MALICIOUS_SUBNET", "MALICIOUS_COHOST", "MALICIOUS_NETBLOCK"]
+        return [
+            "MALICIOUS_IPADDR",
+            "MALICIOUS_INTERNET_NAME",
+            "MALICIOUS_AFFILIATE_IPADDR",
+            "MALICIOUS_AFFILIATE_INTERNET_NAME",
+            "MALICIOUS_SUBNET",
+            "MALICIOUS_COHOST",
+            "MALICIOUS_NETBLOCK"
+        ]
 
-    # Check the regexps to see whether the content indicates maliciousness
-    def contentMalicious(self, content, goodregex, badregex):
-        # First, check for the bad indicators
-        if len(badregex) > 0:
-            for rx in badregex:
-                if re.match(rx, content, re.IGNORECASE | re.DOTALL):
-                    self.sf.debug("Found to be bad against bad regex: " + rx)
+    def queryFeodoTrackerBlacklist(self, target, targetType):
+        blacklist = self.retrieveFeodoTrackerBlacklist()
+
+        if not blacklist:
+            return False
+
+        if targetType == "ip":
+            if target in blacklist:
+                self.debug(f"IP address {target} found in Abuse.ch Feodo Tracker.")
+                return True
+        elif targetType == "netblock":
+            netblock = IPNetwork(target)
+            for ip in blacklist:
+                if IPAddress(ip) in netblock:
+                    self.debug(f"IP address {ip} found within netblock/subnet {target} in Abuse.ch Feodo Tracker.")
                     return True
 
-        # Finally, check for good indicators
-        if len(goodregex) > 0:
-            for rx in goodregex:
-                if re.match(rx, content, re.IGNORECASE | re.DOTALL):
-                    self.sf.debug("Found to be good againt good regex: " + rx)
-                    return False
+        return False
 
-        # If nothing was matched, reply None
-        self.sf.debug("Neither good nor bad, unknown.")
-        return None
+    def retrieveFeodoTrackerBlacklist(self):
+        blacklist = self.sf.cacheGet('abusech_feodo', 24)
 
-    # Look up 'query' type sources
-    def resourceQuery(self, id, target, targetType):
-        self.sf.debug("Querying " + id + " for maliciousness of " + target)
-        for check in malchecks.keys():
-            cid = malchecks[check]['id']
-            if id == cid and malchecks[check]['type'] == "query":
-                url = unicode(malchecks[check]['url'])
-                res = self.sf.fetchUrl(url.format(target), timeout=self.opts['_fetchtimeout'], useragent=self.opts['_useragent'])
-                if res['content'] is None:
-                    self.sf.error("Unable to fetch " + url.format(target), False)
-                    return None
-                if self.contentMalicious(res['content'],
-                                         malchecks[check]['goodregex'],
-                                         malchecks[check]['badregex']):
-                    return url.format(target)
+        if blacklist is not None:
+            return self.parseFeodoTrackerBlacklist(blacklist)
 
-        return None
+        res = self.sf.fetchUrl(
+            "https://feodotracker.abuse.ch/downloads/ipblocklist.txt",
+            timeout=self.opts['_fetchtimeout'],
+            useragent=self.opts['_useragent'],
+        )
 
-    # Look up 'list' type resources
-    def resourceList(self, id, target, targetType):
-        targetDom = ''
-        # Get the base domain if we're supplied a domain
-        if targetType == "domain":
-            targetDom = self.sf.hostDomain(target, self.opts['_internettlds'])
+        if res['code'] != "200":
+            self.error(f"Unexpected HTTP response code {res['code']} from Abuse.ch Abuse.ch Feodo Tracker.")
+            self.errorState = True
+            return None
 
-        for check in malchecks.keys():
-            cid = malchecks[check]['id']
-            if id == cid and malchecks[check]['type'] == "list":
-                data = dict()
-                url = malchecks[check]['url']
-                data['content'] = self.sf.cacheGet("sfmal_" + cid, self.opts.get('cacheperiod', 0))
-                if data['content'] is None:
-                    data = self.sf.fetchUrl(url, timeout=self.opts['_fetchtimeout'], useragent=self.opts['_useragent'])
-                    if data['content'] is None:
-                        self.sf.error("Unable to fetch " + url, False)
-                        return None
-                    else:
-                        self.sf.cachePut("sfmal_" + cid, data['content'])
+        if res['content'] is None:
+            self.error("Received no content from Abuse.ch Feodo Tracker")
+            self.errorState = True
+            return None
 
-                # If we're looking at netblocks
-                if targetType == "netblock":
-                    iplist = list()
-                    # Get the regex, replace {0} with an IP address matcher to 
-                    # build a list of IP.
-                    # Cycle through each IP and check if it's in the netblock.
-                    if 'regex' in malchecks[check]:
-                        rx = malchecks[check]['regex'].replace("{0}",
-                                                               "(\d+\.\d+\.\d+\.\d+)")
-                        pat = re.compile(rx, re.IGNORECASE)
-                        self.sf.debug("New regex for " + check + ": " + rx)
-                        for line in data['content'].split('\n'):
-                            grp = re.findall(pat, line)
-                            if len(grp) > 0:
-                                #self.sf.debug("Adding " + grp[0] + " to list.")
-                                iplist.append(grp[0])
-                    else:
-                        iplist = data['content'].split('\n')
+        self.sf.cachePut("abusech_feodo", res['content'])
 
-                    for ip in iplist:
-                        if len(ip) < 8 or ip.startswith("#"):
-                            continue
-                        ip = ip.strip()
+        return self.parseFeodoTrackerBlacklist(res['content'])
 
-                        try:
-                            if IPAddress(ip) in IPNetwork(target):
-                                self.sf.debug(ip + " found within netblock/subnet " +
-                                              target + " in " + check)
-                                return url
-                        except Exception as e:
-                            self.sf.debug("Error encountered parsing: " + str(e))
-                            continue
+    def parseFeodoTrackerBlacklist(self, blacklist):
+        """Parse plaintext blacklist
 
-                    return None
+        Args:
+            blacklist (str): plaintext blacklist from Abuse.ch Feodo Tracker
 
-                # If we're looking at hostnames/domains/IPs
-                if 'regex' not in malchecks[check]:
-                    for line in data['content'].split('\n'):
-                        if line == target or (targetType == "domain" and line == targetDom):
-                            self.sf.debug(target + "/" + targetDom + " found in " + check + " list.")
-                            return url
-                else:
-                    try:
-                        # Check for the domain and the hostname
-                        rxDom = unicode(malchecks[check]['regex']).format(targetDom)
-                        rxTgt = unicode(malchecks[check]['regex']).format(target)
-                        for line in data['content'].split('\n'):
-                            if (targetType == "domain" and re.match(rxDom, line, re.IGNORECASE)) or \
-                                    re.match(rxTgt, line, re.IGNORECASE):
-                                self.sf.debug(target + "/" + targetDom + " found in " + check + " list.")
-                                return url
-                    except BaseException as e:
-                        self.sf.debug("Error encountered parsing 2: " + str(e))
-                        continue
+        Returns:
+            list: list of blacklisted IP addresses
+        """
+        ips = list()
 
-        return None
+        if not blacklist:
+            return ips
 
-    def lookupItem(self, resourceId, itemType, target):
-        for check in malchecks.keys():
-            cid = malchecks[check]['id']
-            if cid == resourceId and itemType in malchecks[check]['checks']:
-                self.sf.debug("Checking maliciousness of " + target + " (" +
-                              itemType + ") with: " + cid)
-                if malchecks[check]['type'] == "query":
-                    return self.resourceQuery(cid, target, itemType)
-                if malchecks[check]['type'] == "list":
-                    return self.resourceList(cid, target, itemType)
+        for ip in blacklist.split('\n'):
+            ip = ip.strip()
+            if not ip:
+                continue
+            if ip.startswith('#'):
+                continue
+            if not self.sf.validIP(ip):
+                continue
+            ips.append(ip)
 
-        return None
+        return ips
 
-    # Handle events sent to this module
+    def querySslBlacklist(self, target, targetType):
+        blacklist = self.retrieveSslBlacklist()
+
+        if not blacklist:
+            return False
+
+        if targetType == "ip":
+            if target in blacklist:
+                self.debug(f"IP address {target} found in Abuse.ch SSL Blacklist.")
+                return True
+        elif targetType == "netblock":
+            netblock = IPNetwork(target)
+            for ip in blacklist:
+                if IPAddress(ip) in netblock:
+                    self.debug(f"IP address {ip} found within netblock/subnet {target} in Abuse.ch SSL Blacklist.")
+                    return True
+
+        return False
+
+    def retrieveSslBlacklist(self):
+        blacklist = self.sf.cacheGet('abusech_ssl', 24)
+
+        if blacklist is not None:
+            return self.parseSslBlacklist(blacklist)
+
+        res = self.sf.fetchUrl(
+            "https://sslbl.abuse.ch/blacklist/sslipblacklist.csv",
+            timeout=self.opts['_fetchtimeout'],
+            useragent=self.opts['_useragent'],
+        )
+
+        if res['code'] != "200":
+            self.error(f"Unexpected HTTP response code {res['code']} from Abuse.ch Abuse.ch Feodo Tracker.")
+            self.errorState = True
+            return None
+
+        if res['content'] is None:
+            self.error("Received no content from Abuse.ch Feodo Tracker")
+            self.errorState = True
+            return None
+
+        self.sf.cachePut("abusech_ssl", res['content'])
+
+        return self.parseSslBlacklist(res['content'])
+
+    def parseSslBlacklist(self, blacklist):
+        """Parse plaintext blacklist
+
+        Args:
+            blacklist (str): CSV blacklist from Abuse.ch SSL Blacklist
+
+        Returns:
+            list: list of blacklisted IP addresses
+        """
+        ips = list()
+
+        if not blacklist:
+            return ips
+
+        for line in blacklist.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('#'):
+                continue
+            csv = line.split(',')
+            if len(csv) < 2:
+                continue
+            ip = csv[1]
+            if not self.sf.validIP(ip):
+                continue
+            ips.append(ip)
+
+        return ips
+
+    def queryUrlHausBlacklist(self, target, targetType):
+        blacklist = self.retrieveUrlHausBlacklist()
+
+        if not blacklist:
+            return False
+
+        if targetType == "ip":
+            if target in blacklist:
+                self.debug(f"IP address {target} found in Abuse.ch URL Haus Blacklist.")
+                return True
+        elif targetType == "netblock":
+            netblock = IPNetwork(target)
+            for ip in blacklist:
+                if IPAddress(ip) in netblock:
+                    self.debug(f"IP address {ip} found within netblock/subnet {target} in Abuse.ch URL Haus Blacklist.")
+                    return True
+        elif targetType == "domain":
+            if target.lower() in blacklist:
+                self.debug(f"Host name {target} found in Abuse.ch URL Haus Blacklist.")
+                return True
+
+        return False
+
+    def retrieveUrlHausBlacklist(self):
+        blacklist = self.sf.cacheGet('abusech_urlhaus', 24)
+
+        if blacklist is not None:
+            return self.parseUrlHausBlacklist(blacklist)
+
+        res = self.sf.fetchUrl(
+            "https://urlhaus.abuse.ch/downloads/csv_recent/",
+            timeout=self.opts['_fetchtimeout'],
+            useragent=self.opts['_useragent'],
+        )
+
+        if res['code'] != "200":
+            self.error(f"Unexpected HTTP response code {res['code']} from Abuse.ch URL Haus.")
+            self.errorState = True
+            return None
+
+        if res['content'] is None:
+            self.error("Received no content from Abuse.ch URL Haus")
+            self.errorState = True
+            return None
+
+        self.sf.cachePut("abusech_urlhaus", res['content'])
+
+        return self.parseUrlHausBlacklist(res['content'])
+
+    def parseUrlHausBlacklist(self, blacklist):
+        """Parse plaintext blacklist
+
+        Args:
+            blacklist (str): plaintext blacklist from Abuse.ch URL Haus
+
+        Returns:
+            list: list of blacklisted hosts
+        """
+        hosts = list()
+
+        if not blacklist:
+            return hosts
+
+        for line in blacklist.split('\n'):
+            if not line:
+                continue
+            if line.startswith('#'):
+                continue
+
+            # Note: URL parsing and validation with sf.validHost() is too slow to use here
+            url = line.strip().lower()
+            if len(url.split("/")) < 3:
+                continue
+            host = url.split("/")[2].split(':')[0]
+            if not host:
+                continue
+            if "." not in host:
+                continue
+            hosts.append(host)
+
+        return hosts
+
     def handleEvent(self, event):
         eventName = event.eventType
         srcModuleName = event.module
         eventData = event.data
 
-        self.sf.debug("Received event, " + eventName + ", from " + srcModuleName)
+        self.debug(f"Received event, {eventName}, from {srcModuleName}")
 
         if eventData in self.results:
-            self.sf.debug("Skipping " + eventData + ", already checked.")
-            return None
+            self.debug(f"Skipping {eventData}, already checked.")
+            return
+
+        if self.errorState:
+            return
+
+        self.results[eventData] = True
+
+        if eventName == 'IP_ADDRESS':
+            targetType = 'ip'
+            evtType = 'MALICIOUS_IPADDR'
+        elif eventName == 'AFFILIATE_IPADDR':
+            if not self.opts.get('checkaffiliates', False):
+                return
+            targetType = 'ip'
+            evtType = 'MALICIOUS_AFFILIATE_IPADDR'
+        elif eventName == 'NETBLOCK_OWNER':
+            if not self.opts.get('checknetblocks', False):
+                return
+            targetType = 'netblock'
+            evtType = 'MALICIOUS_NETBLOCK'
+        elif eventName == 'NETBLOCK_MEMBER':
+            if not self.opts.get('checksubnets', False):
+                return
+            targetType = 'netblock'
+            evtType = 'MALICIOUS_SUBNET'
+        elif eventName == "INTERNET_NAME":
+            targetType = 'domain'
+            evtType = "MALICIOUS_INTERNET_NAME"
+        elif eventName == 'AFFILIATE_INTERNET_NAME':
+            if not self.opts.get('checkaffiliates', False):
+                return
+            targetType = 'domain'
+            evtType = 'MALICIOUS_AFFILIATE_INTERNET_NAME'
+        elif eventName == 'CO_HOSTED_SITE':
+            if not self.opts.get('checkcohosts', False):
+                return
+            targetType = 'domain'
+            evtType = 'MALICIOUS_COHOST'
         else:
-            self.results[eventData] = True
+            return
 
-        if eventName == 'CO_HOSTED_SITE' and not self.opts.get('checkcohosts', False):
-            return None
-        if eventName == 'AFFILIATE_IPADDR' \
-                and not self.opts.get('checkaffiliates', False):
-            return None
-        if eventName == 'NETBLOCK_OWNER' and not self.opts.get('checknetblocks', False):
-            return None
-        if eventName == 'NETBLOCK_MEMBER' and not self.opts.get('checksubnets', False):
-            return None
+        if targetType in ['ip', 'netblock']:
+            self.debug(f"Checking maliciousness of {eventData} ({eventName}) with Abuse.ch Feodo Tracker")
+            if self.queryFeodoTrackerBlacklist(eventData, targetType):
+                url = "https://feodotracker.abuse.ch/downloads/ipblocklist.txt"
+                text = f"Abuse.ch Feodo Tracker [{eventData}]\n<SFURL>{url}</SFURL>"
+                evt = SpiderFootEvent(evtType, text, self.__name__, event)
+                self.notifyListeners(evt)
 
-        for check in malchecks.keys():
-            cid = malchecks[check]['id']
-            # If the module is enabled..
-            if self.opts[cid]:
-                if eventName in ['IP_ADDRESS', 'AFFILIATE_IPADDR']:
-                    typeId = 'ip'
-                    if eventName == 'IP_ADDRESS':
-                        evtType = 'MALICIOUS_IPADDR'
-                    else:
-                        evtType = 'MALICIOUS_AFFILIATE_IPADDR'
+            self.debug(f"Checking maliciousness of {eventData} ({eventName}) with Abuse.ch SSL Blacklist")
+            if self.querySslBlacklist(eventData, targetType):
+                url = "https://sslbl.abuse.ch/blacklist/sslipblacklist.csv"
+                text = f"Abuse.ch SSL Blacklist [{eventData}]\n<SFURL>{url}</SFURL>"
+                evt = SpiderFootEvent(evtType, text, self.__name__, event)
+                self.notifyListeners(evt)
 
-                if eventName in ['BGP_AS_OWNER', 'BGP_AS_MEMBER']:
-                    typeId = 'asn'
-                    evtType = 'MALICIOUS_ASN'
-
-                if eventName in ['INTERNET_NAME', 'CO_HOSTED_SITE',
-                                 'AFFILIATE_INTERNET_NAME', ]:
-                    typeId = 'domain'
-                    if eventName == "INTERNET_NAME":
-                        evtType = "MALICIOUS_INTERNET_NAME"
-                    if eventName == 'AFFILIATE_INTERNET_NAME':
-                        evtType = 'MALICIOUS_AFFILIATE_INTERNET_NAME'
-                    if eventName == 'CO_HOSTED_SITE':
-                        evtType = 'MALICIOUS_COHOST'
-
-                if eventName == 'NETBLOCK_OWNER':
-                    typeId = 'netblock'
-                    evtType = 'MALICIOUS_NETBLOCK'
-                if eventName == 'NETBLOCK_MEMBER':
-                    typeId = 'netblock'
-                    evtType = 'MALICIOUS_SUBNET'
-
-                url = self.lookupItem(cid, typeId, eventData)
-                if self.checkForStop():
-                    return None
-
-                # Notify other modules of what you've found
-                if url is not None:
-                    text = check + " [" + eventData + "]\n" + "<SFURL>" + url + "</SFURL>"
-                    evt = SpiderFootEvent(evtType, text, self.__name__, event)
-                    self.notifyListeners(evt)
-
-        return None
+        if targetType in ['ip', 'domain']:
+            self.debug(f"Checking maliciousness of {eventData} ({eventName}) with Abuse.ch URL Haus")
+            if self.queryUrlHausBlacklist(eventData, targetType):
+                url = "https://urlhaus.abuse.ch/downloads/csv_recent/"
+                text = f"Abuse.ch URL Haus Blacklist [{eventData}]\n<SFURL>{url}</SFURL>"
+                evt = SpiderFootEvent(evtType, text, self.__name__, event)
+                self.notifyListeners(evt)
 
 # End of sfp_abusech class

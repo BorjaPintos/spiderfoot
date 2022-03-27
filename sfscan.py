@@ -9,294 +9,557 @@
 # Copyright:    (c) Steve Micallef 2013
 # License:      GPL
 # -----------------------------------------------------------------
-import traceback
-import time
-import sys
-import socks
 import socket
+import sys
+import time
+import queue
+import traceback
+from time import sleep
+from copy import deepcopy
+from contextlib import suppress
+from collections import OrderedDict
+
 import dns.resolver
-import threading
-import random
-from copy import deepcopy, copy
-from sfdb import SpiderFootDb
-from sflib import SpiderFoot, SpiderFootEvent, SpiderFootTarget, \
-    SpiderFootPlugin, globalScanStatus
 
-# Eventually change this to be able to control multiple scan instances
-class SpiderFootScanner(threading.Thread):
-    # Thread-safe storage
-    ts = None
-    # Temporary storage
-    temp = None
+from sflib import SpiderFoot
+from spiderfoot import SpiderFootDb, SpiderFootEvent, SpiderFootPlugin, SpiderFootTarget, SpiderFootHelpers, SpiderFootThreadPool, logger
 
-    # moduleOpts not yet used
-    def __init__(self, scanName, scanTarget, targetType, scanId, moduleList,
-                 globalOpts, moduleOpts):
 
-        # Initialize the thread
-        threading.Thread.__init__(self, name="SF_" + scanId + \
-                                             str(random.SystemRandom().randint(100000, 999999)))
+def startSpiderFootScanner(loggingQueue, *args, **kwargs):
+    logger.logWorkerSetup(loggingQueue)
+    return SpiderFootScanner(*args, **kwargs)
 
-        # Temporary data to be used in startScan
-        self.temp = dict()
-        self.temp['config'] = deepcopy(globalOpts)
-        self.temp['targetValue'] = scanTarget
-        self.temp['targetType'] = targetType
-        self.temp['moduleList'] = moduleList
-        self.temp['scanName'] = scanName
-        self.temp['scanId'] = scanId
 
-    # Set the status of the currently running scan (if any)
-    def setStatus(self, status, started=None, ended=None):
-        if self.ts is None:
-            print("Internal Error: Status set attempted before " + \
-                  "SpiderFootScanner was ready.")
-            exit(-1)
+class SpiderFootScanner():
+    """SpiderFootScanner object.
 
-        self.ts.status = status
-        self.ts.dbh.scanInstanceSet(self.ts.scanId, started, ended, status)
-        globalScanStatus.setStatus(self.ts.scanId, status)
-        return None
+    Attributes:
+        scanId (str): unique ID of the scan
+        status (str): status of the scan
+    """
 
-    def run(self):
-        self.startScan()
+    __scanId = None
+    __status = None
+    __config = None
+    __sf = None
+    __dbh = None
+    __targetValue = None
+    __targetType = None
+    __moduleList = list()
+    __target = None
+    __moduleInstances = dict()
+    __modconfig = dict()
+    __scanName = None
 
-    def getId(self):
-        if hasattr(self.ts, 'scanId'):
-            return self.ts.scanId
-        return None
+    def __init__(self, scanName, scanId, targetValue, targetType, moduleList, globalOpts, start=True):
+        """Initialize SpiderFootScanner object.
 
-    # Start running a scan
-    def startScan(self):
-        global globalScanStatus
+        Args:
+            scanName (str): name of the scan
+            scanId (str): unique ID of the scan
+            targetValue (str): scan target
+            targetType (str): scan target type
+            moduleList (list): list of modules to run
+            globalOpts (dict): scan options
+            start (bool): start the scan immediately
 
-        self.ts = threading.local()
-        self.ts.moduleInstances = dict()
-        self.ts.sf = SpiderFoot(self.temp['config'])
-        self.ts.config = deepcopy(self.temp['config'])
-        self.ts.dbh = SpiderFootDb(self.temp['config'])
-        self.ts.targetValue = self.temp['targetValue']
-        self.ts.targetType = self.temp['targetType']
-        self.ts.moduleList = self.temp['moduleList']
-        self.ts.modconfig = dict()
-        self.ts.scanName = self.temp['scanName']
-        self.ts.scanId = self.temp['scanId']
-        aborted = False
-        self.ts.sf.setDbh(self.ts.dbh)
+        Raises:
+            TypeError: arg type was invalid
+            ValueError: arg value was invalid
 
-        # Create a unique ID for this scan and create it in the back-end DB.
-        self.ts.sf.setGUID(self.ts.scanId)
-        self.ts.dbh.scanInstanceCreate(self.ts.scanId,
-                                       self.ts.scanName, self.ts.targetValue)
-        self.setStatus("STARTING", time.time() * 1000, None)
+        Todo:
+             Eventually change this to be able to control multiple scan instances
+        """
+        if not isinstance(globalOpts, dict):
+            raise TypeError(f"globalOpts is {type(globalOpts)}; expected dict()")
+        if not globalOpts:
+            raise ValueError("globalOpts is empty")
+
+        self.__config = deepcopy(globalOpts)
+        self.__dbh = SpiderFootDb(self.__config)
+
+        if not isinstance(scanName, str):
+            raise TypeError(f"scanName is {type(scanName)}; expected str()")
+        if not scanName:
+            raise ValueError("scanName value is blank")
+
+        self.__scanName = scanName
+
+        if not isinstance(scanId, str):
+            raise TypeError(f"scanId is {type(scanId)}; expected str()")
+        if not scanId:
+            raise ValueError("scanId value is blank")
+
+        if not isinstance(targetValue, str):
+            raise TypeError(f"targetValue is {type(targetValue)}; expected str()")
+        if not targetValue:
+            raise ValueError("targetValue value is blank")
+
+        self.__targetValue = targetValue
+
+        if not isinstance(targetType, str):
+            raise TypeError(f"targetType is {type(targetType)}; expected str()")
+        if not targetType:
+            raise ValueError("targetType value is blank")
+
+        self.__targetType = targetType
+
+        if not isinstance(moduleList, list):
+            raise TypeError(f"moduleList is {type(moduleList)}; expected list()")
+        if not moduleList:
+            raise ValueError("moduleList is empty")
+
+        self.__moduleList = moduleList
+
+        self.__sf = SpiderFoot(self.__config)
+        self.__sf.dbh = self.__dbh
+
+        # Create a unique ID for this scan in the back-end DB.
+        if scanId:
+            self.__scanId = scanId
+        else:
+            self.__scanId = SpiderFootHelpers.genScanInstanceId()
+
+        self.__sf.scanId = self.__scanId
+        self.__dbh.scanInstanceCreate(self.__scanId, self.__scanName, self.__targetValue)
+
         # Create our target
-        target = SpiderFootTarget(self.ts.targetValue, self.ts.targetType)
+        try:
+            self.__target = SpiderFootTarget(self.__targetValue, self.__targetType)
+        except (TypeError, ValueError) as e:
+            self.__sf.status(f"Scan [{self.__scanId}] failed: {e}")
+            self.__setStatus("ERROR-FAILED", None, time.time() * 1000)
+            raise ValueError(f"Invalid target: {e}")
 
         # Save the config current set for this scan
-        self.ts.config['_modulesenabled'] = self.ts.moduleList
-        self.ts.dbh.scanConfigSet(self.ts.scanId,
-                                  self.ts.sf.configSerialize(deepcopy(self.ts.config)))
+        self.__config['_modulesenabled'] = self.__moduleList
+        self.__dbh.scanConfigSet(self.__scanId, self.__sf.configSerialize(deepcopy(self.__config)))
 
-        self.ts.sf.status("Scan [" + self.ts.scanId + "] initiated.")
-        # moduleList = list of modules the user wants to run
+        # Process global options that point to other places for data
+
+        # If a proxy server was specified, set it up
+        proxy_type = self.__config.get('_socks1type')
+        if proxy_type:
+            # TODO: allow DNS lookup to be configurable when using a proxy
+            # - proxy DNS lookup: socks5h:// and socks4a://
+            # - local DNS lookup: socks5:// and socks4://
+            if proxy_type == '4':
+                proxy_proto = 'socks4://'
+            elif proxy_type == '5':
+                proxy_proto = 'socks5://'
+            elif proxy_type == 'HTTP':
+                proxy_proto = 'http://'
+            elif proxy_type == 'TOR':
+                proxy_proto = 'socks5h://'
+            else:
+                self.__sf.status(f"Scan [{self.__scanId}] failed: Invalid proxy type: {proxy_type}")
+                self.__setStatus("ERROR-FAILED", None, time.time() * 1000)
+                raise ValueError(f"Invalid proxy type: {proxy_type}")
+
+            proxy_host = self.__config.get('_socks2addr', '')
+
+            if not proxy_host:
+                self.__sf.status(f"Scan [{self.__scanId}] failed: Proxy type is set ({proxy_type}) but proxy address value is blank")
+                self.__setStatus("ERROR-FAILED", None, time.time() * 1000)
+                raise ValueError(f"Proxy type is set ({proxy_type}) but proxy address value is blank")
+
+            proxy_port = int(self.__config.get('_socks3port') or 0)
+
+            if not proxy_port:
+                if proxy_type in ['4', '5']:
+                    proxy_port = 1080
+                elif proxy_type.upper() == 'HTTP':
+                    proxy_port = 8080
+                elif proxy_type.upper() == 'TOR':
+                    proxy_port = 9050
+
+            proxy_username = self.__config.get('_socks4user', '')
+            proxy_password = self.__config.get('_socks5pwd', '')
+
+            if proxy_username or proxy_password:
+                proxy_auth = f"{proxy_username}:{proxy_password}"
+                proxy = f"{proxy_proto}{proxy_auth}@{proxy_host}:{proxy_port}"
+            else:
+                proxy = f"{proxy_proto}{proxy_host}:{proxy_port}"
+
+            self.__sf.debug(f"Using proxy: {proxy}")
+            self.__sf.socksProxy = proxy
+        else:
+            self.__sf.socksProxy = None
+
+        # Override the default DNS server
+        if self.__config['_dnsserver']:
+            res = dns.resolver.Resolver()
+            res.nameservers = [self.__config['_dnsserver']]
+            dns.resolver.override_system_resolver(res)
+        else:
+            dns.resolver.restore_system_resolver()
+
+        # Set the user agent
+        self.__config['_useragent'] = self.__sf.optValueToData(self.__config['_useragent'])
+
+        # Get internet TLDs
+        tlddata = self.__sf.cacheGet("internet_tlds", self.__config['_internettlds_cache'])
+
+        # If it wasn't loadable from cache, load it from scratch
+        if tlddata is None:
+            self.__config['_internettlds'] = self.__sf.optValueToData(self.__config['_internettlds'])
+            self.__sf.cachePut("internet_tlds", self.__config['_internettlds'])
+        else:
+            self.__config["_internettlds"] = tlddata.splitlines()
+
+        self.__setStatus("INITIALIZING", time.time() * 1000, None)
+
+        self.__sharedThreadPool = SpiderFootThreadPool(threads=self.__config.get("_maxthreads", 3), name='sharedThreadPool')
+
+        # Used when module threading is enabled
+        self.eventQueue = None
+
+        if start:
+            self.__startScan()
+
+    @property
+    def scanId(self):
+        return self.__scanId
+
+    @property
+    def status(self):
+        return self.__status
+
+    def __setStatus(self, status, started=None, ended=None):
+        """Set the status of the currently running scan (if any).
+
+        Args:
+            status (str): scan status
+            started (float): timestamp at start of scan
+            ended (float): timestamp at end of scan
+
+        Raises:
+            TypeError: arg type was invalid
+            ValueError: arg value was invalid
+        """
+        if not isinstance(status, str):
+            raise TypeError(f"status is {type(status)}; expected str()")
+
+        if status not in [
+            "INITIALIZING",
+            "STARTING",
+            "STARTED",
+            "RUNNING",
+            "ABORT-REQUESTED",
+            "ABORTED",
+            "ABORTING",
+            "FINISHED",
+            "ERROR-FAILED"
+        ]:
+            raise ValueError(f"Invalid scan status {status}")
+
+        self.__status = status
+        self.__dbh.scanInstanceSet(self.__scanId, started, ended, status)
+
+    def __startScan(self):
+        """Start running a scan.
+
+        Raises:
+            AssertionError: Never actually raised.
+        """
+        failed = True
+
         try:
-            # Process global options that point to other places for data
+            self.__setStatus("STARTING", time.time() * 1000, None)
+            self.__sf.status(f"Scan [{self.__scanId}] for '{self.__target.targetValue}' initiated.")
 
-            # Save default socket methods that will be overridden
-            if not hasattr(socket, 'savedsocket'):
-                socket.savedsocket = socket.socket
-                socket.savedcreate_connection = socket.create_connection
-                #socket.savedgetaddrinfo = socket.getaddrinfo
+            self.eventQueue = queue.Queue()
 
-            # If a SOCKS server was specified, set it up
-            if self.ts.config['_socks1type'] != '':
-                socksType = socks.PROXY_TYPE_SOCKS4
-                socksDns = self.ts.config['_socks6dns']
-                socksAddr = self.ts.config['_socks2addr']
-                socksPort = int(self.ts.config['_socks3port'])
-                socksUsername = ''
-                socksPassword = ''
+            self.__sharedThreadPool.start()
 
-                if self.ts.config['_socks1type'] == '4':
-                    socksType = socks.PROXY_TYPE_SOCKS4
-                if self.ts.config['_socks1type'] == '5':
-                    socksType = socks.PROXY_TYPE_SOCKS5
-                    socksUsername = self.ts.config['_socks4user']
-                    socksPassword = self.ts.config['_socks5pwd']
+            # moduleList = list of modules the user wants to run
+            self.__sf.debug(f"Loading {len(self.__moduleList)} modules ...")
+            for modName in self.__moduleList:
+                if not modName:
+                    continue
 
-                if self.ts.config['_socks1type'] == 'HTTP':
-                    socksType = socks.PROXY_TYPE_HTTP
-
-                if self.ts.config['_socks1type'] == 'TOR':
-                    socksType = socks.PROXY_TYPE_SOCKS5
-
-                self.ts.sf.debug("SOCKS: " + socksAddr + ":" + str(socksPort) + \
-                                 "(" + socksUsername + ":" + socksPassword + ")")
-                socks.setdefaultproxy(socksType, socksAddr, socksPort,
-                                      socksDns, socksUsername, socksPassword)
-
-                # Override the default socket and getaddrinfo calls with the 
-                # SOCKS ones. Just ensure we don't also try and SOCKS-proxy
-                # connectivity to the TOR control port.
-                def _create_connection(address, timeout=None, source_address=None):
-                    if socksAddr not in address:
-                        sock = socks.socksocket()
-                        sock.setproxy(socks.PROXY_TYPE_SOCKS5, socksAddr, socksPort)
-                        sock.settimeout(self.ts.config['_fetchtimeout'])
-                        sock.connect(address)
-                        return sock
-                    else:
-                        sock = socket.socket
-                        sock.settimeout(self.ts.config['_fetchtimeout'])
-                        sock.connect(address)
-                        return sock
-
-                socket.socket = socks.socksocket
-                socket.setdefaulttimeout(self.ts.config['_fetchtimeout'])
-                socket.create_connection = _create_connection
-                #socket.getaddrinfo = socks.getaddrinfo
-                self.ts.sf.updateSocket(socket)
-            else:
-                # BUG: If the user had a SOCKS proxy set
-                # and then decided to unset it, the original socket class
-                # is not reverted to its default state - we still have
-                # the SOCKS version of socket.
-                socket.socket = socket.savedsocket
-                socket.setdefaulttimeout(self.ts.config['_fetchtimeout'])
-                socket.create_connection = socket.savedcreate_connection
-                #socket.getaddrinfo = socket.savedgetaddrinfo
-                self.ts.sf.revertSocket()
-
-            # Override the default DNS server
-            if self.ts.config['_dnsserver'] != "":
-                res = dns.resolver.Resolver()
-                res.nameservers = [self.ts.config['_dnsserver']]
-                dns.resolver.override_system_resolver(res)
-            else:
-                dns.resolver.restore_system_resolver()
-
-            # Set the user agent
-            self.ts.config['_useragent'] = self.ts.sf.optValueToData(
-                self.ts.config['_useragent'])
-
-            # Get internet TLDs
-            tlddata = self.ts.sf.cacheGet("internet_tlds",
-                                          self.ts.config['_internettlds_cache'])
-            # If it wasn't loadable from cache, load it from scratch
-            if tlddata is None:
-                self.ts.config['_internettlds'] = self.ts.sf.optValueToData(
-                    self.ts.config['_internettlds'])
-                self.ts.sf.cachePut("internet_tlds", self.ts.config['_internettlds'])
-            else:
-                self.ts.config["_internettlds"] = tlddata.splitlines()
-
-            for modName in self.ts.moduleList:
-                if modName == '':
+                # Module may have been renamed or removed
+                if modName not in self.__config['__modules__']:
+                    self.__sf.error(f"Failed to load module: {modName}")
                     continue
 
                 try:
-                    module = __import__('modules.' + modName, globals(), locals(),
-                                        [modName])
+                    module = __import__('modules.' + modName, globals(), locals(), [modName])
                 except ImportError:
-                    self.ts.sf.error("Failed to load module: " + modName, False)
+                    self.__sf.error(f"Failed to load module: {modName}")
                     continue
 
-                mod = getattr(module, modName)()
-                mod.__name__ = modName
-
-                # Module may have been renamed or removed
-                if modName not in self.ts.config['__modules__']:
+                try:
+                    mod = getattr(module, modName)()
+                    mod.__name__ = modName
+                except Exception:
+                    self.__sf.error(f"Module {modName} initialization failed: {traceback.format_exc()}")
                     continue
 
-                # Set up the module
-                # Configuration is a combined global config with module-specific options
-                self.ts.modconfig[modName] = deepcopy(self.ts.config['__modules__'][modName]['opts'])
-                for opt in self.ts.config.keys():
-                    self.ts.modconfig[modName][opt] = deepcopy(self.ts.config[opt])
+                # Set up the module options, scan ID, database handle and listeners
+                try:
+                    # Configuration is a combined global config with module-specific options
+                    self.__modconfig[modName] = deepcopy(self.__config['__modules__'][modName]['opts'])
+                    for opt in list(self.__config.keys()):
+                        self.__modconfig[modName][opt] = deepcopy(self.__config[opt])
 
-                mod.clearListeners()  # clear any listener relationships from the past
-                mod.setup(self.ts.sf, self.ts.modconfig[modName])
-                mod.setDbh(self.ts.dbh)
-                mod.setScanId(self.ts.scanId)
+                    # clear any listener relationships from the past
+                    mod.clearListeners()
+                    mod.setScanId(self.__scanId)
+                    mod.setSharedThreadPool(self.__sharedThreadPool)
+                    mod.setDbh(self.__dbh)
+                    mod.setup(self.__sf, self.__modconfig[modName])
+                except Exception:
+                    self.__sf.error(f"Module {modName} initialization failed: {traceback.format_exc()}")
+                    mod.errorState = True
+                    continue
 
-                # Give modules a chance to 'enrich' the original target with
-                # aliases of that target.
-                newTarget = mod.enrichTarget(target)
-                if newTarget is not None:
-                    target = newTarget
-                self.ts.moduleInstances[modName] = mod
-
-                # Override the module's local socket module
-                # to be the SOCKS one.
-                if self.ts.config['_socks1type'] != '':
-                    mod._updateSocket(socket)
+                # Override the module's local socket module to be the SOCKS one.
+                if self.__config['_socks1type'] != '':
+                    try:
+                        mod._updateSocket(socket)
+                    except Exception as e:
+                        self.__sf.error(f"Module {modName} socket setup failed: {e}")
+                        continue
 
                 # Set up event output filters if requested
-                if self.ts.config['__outputfilter']:
-                    mod.setOutputFilter(self.ts.config['__outputfilter'])
-
-                self.ts.sf.status(modName + " module loaded.")
-
-            # Register listener modules and then start all modules sequentially
-            for module in self.ts.moduleInstances.values():
-                # Register the target with the module
-                module.setTarget(target)
-
-                for listenerModule in self.ts.moduleInstances.values():
-                    # Careful not to register twice or you will get duplicate events
-                    if listenerModule in module._listenerModules:
+                if self.__config['__outputfilter']:
+                    try:
+                        mod.setOutputFilter(self.__config['__outputfilter'])
+                    except Exception as e:
+                        self.__sf.error(f"Module {modName} output filter setup failed: {e}")
                         continue
-                    # Note the absence of a check for whether a module can register
-                    # to itself. That is intentional because some modules will
-                    # act on their own notifications (e.g. sfp_dns)!
-                    if listenerModule.watchedEvents() is not None:
-                        module.registerListener(listenerModule)
+
+                # Give modules a chance to 'enrich' the original target with aliases of that target.
+                try:
+                    newTarget = mod.enrichTarget(self.__target)
+                    if newTarget is not None:
+                        self.__target = newTarget
+                except Exception as e:
+                    self.__sf.error(f"Module {modName} target enrichment failed: {e}")
+                    continue
+
+                # Register the target with the module
+                try:
+                    mod.setTarget(self.__target)
+                except Exception as e:
+                    self.__sf.error(f"Module {modName} failed to set target '{self.__target}': {e}")
+                    continue
+
+                # Set up the outgoing event queue
+                try:
+                    mod.outgoingEventQueue = self.eventQueue
+                    mod.incomingEventQueue = queue.Queue()
+                except Exception as e:
+                    self.__sf.error(f"Module {modName} event queue setup failed: {e}")
+                    continue
+
+                self.__moduleInstances[modName] = mod
+                self.__sf.status(f"{modName} module loaded.")
+
+            self.__sf.debug(f"Scan [{self.__scanId}] loaded {len(self.__moduleInstances)} modules.")
+
+            if not self.__moduleInstances:
+                self.__setStatus("ERROR-FAILED", None, time.time() * 1000)
+                self.__dbh.close()
+                return
+
+            # sort modules by priority
+            self.__moduleInstances = OrderedDict(sorted(self.__moduleInstances.items(), key=lambda m: m[-1]._priority))
 
             # Now we are ready to roll..
-            self.setStatus("RUNNING")
+            self.__setStatus("RUNNING")
 
             # Create a pseudo module for the root event to originate from
             psMod = SpiderFootPlugin()
             psMod.__name__ = "SpiderFoot UI"
-            psMod.setTarget(target)
+            psMod.setTarget(self.__target)
+            psMod.setDbh(self.__dbh)
             psMod.clearListeners()
-            for mod in self.ts.moduleInstances.values():
-                if mod.watchedEvents() is not None:
-                    psMod.registerListener(mod)
+            psMod.outgoingEventQueue = self.eventQueue
+            psMod.incomingEventQueue = queue.Queue()
 
             # Create the "ROOT" event which un-triggered modules will link events to
-            rootEvent = SpiderFootEvent("ROOT", self.ts.targetValue, "", None)
+            rootEvent = SpiderFootEvent("ROOT", self.__targetValue, "", None)
             psMod.notifyListeners(rootEvent)
-            firstEvent = SpiderFootEvent(self.ts.targetType, self.ts.targetValue,
+            firstEvent = SpiderFootEvent(self.__targetType, self.__targetValue,
                                          "SpiderFoot UI", rootEvent)
             psMod.notifyListeners(firstEvent)
+
+            # Special case.. check if an INTERNET_NAME is also a domain
+            if self.__targetType == 'INTERNET_NAME':
+                if self.__sf.isDomain(self.__targetValue, self.__config['_internettlds']):
+                    firstEvent = SpiderFootEvent('DOMAIN_NAME', self.__targetValue,
+                                                 "SpiderFoot UI", rootEvent)
+                    psMod.notifyListeners(firstEvent)
 
             # If in interactive mode, loop through this shared global variable
             # waiting for inputs, and process them until my status is set to
             # FINISHED.
 
-            # Check in case the user requested to stop the scan between modules 
+            # Check in case the user requested to stop the scan between modules
             # initializing
-            for module in self.ts.moduleInstances.values():
-                if module.checkForStop():
-                    self.setStatus('ABORTING')
-                    aborted = True
-                    break
+            scanstatus = self.__dbh.scanInstanceGet(self.__scanId)
+            if scanstatus and scanstatus[5] == "ABORT-REQUESTED":
+                raise AssertionError("ABORT-REQUESTED")
 
-            if aborted:
-                self.ts.sf.status("Scan [" + self.ts.scanId + "] aborted.")
-                self.setStatus("ABORTED", None, time.time() * 1000)
-            else:
-                self.ts.sf.status("Scan [" + self.ts.scanId + "] completed.")
-                self.setStatus("FINISHED", None, time.time() * 1000)
+            # start threads
+            self.waitForThreads()
+            failed = False
+
+        except (KeyboardInterrupt, AssertionError):
+            self.__sf.status(f"Scan [{self.__scanId}] aborted.")
+            self.__setStatus("ABORTED", None, time.time() * 1000)
+
         except BaseException as e:
             exc_type, exc_value, exc_traceback = sys.exc_info()
-            self.ts.sf.error("Unhandled exception (" + e.__class__.__name__ + ") " + \
-                             "encountered during scan. Please report this as a bug: " + \
-                             repr(traceback.format_exception(exc_type, exc_value, exc_traceback)), False)
-            self.ts.sf.status("Scan [" + self.ts.scanId + "] failed: " + str(e))
-            self.setStatus("ERROR-FAILED", None, time.time() * 1000)
+            self.__sf.error(f"Unhandled exception ({e.__class__.__name__}) encountered during scan."
+                            + "Please report this as a bug: "
+                            + repr(traceback.format_exception(exc_type, exc_value, exc_traceback)))
+            self.__sf.status(f"Scan [{self.__scanId}] failed: {e}")
+            self.__setStatus("ERROR-FAILED", None, time.time() * 1000)
 
-        self.ts.dbh.close()
-        del self.ts
-        del self.temp
+        finally:
+            if not failed:
+                self.__sf.status(f"Scan [{self.__scanId}] completed.")
+                self.__setStatus("FINISHED", None, time.time() * 1000)
+            self.__dbh.close()
+
+    def waitForThreads(self):
+        counter = 0
+
+        try:
+            if not self.eventQueue:
+                return
+
+            # start one thread for each module
+            for mod in self.__moduleInstances.values():
+                mod.start()
+            final_passes = 3
+
+            # watch for newly-generated events
+            while True:
+
+                # log status of threads every 10 iterations
+                log_status = counter % 10 == 0
+                counter += 1
+
+                if log_status:
+                    scanstatus = self.__dbh.scanInstanceGet(self.__scanId)
+                    if scanstatus and scanstatus[5] == "ABORT-REQUESTED":
+                        raise AssertionError("ABORT-REQUESTED")
+
+                try:
+                    sfEvent = self.eventQueue.get_nowait()
+                    self.__sf.debug(f"waitForThreads() got event, {sfEvent.eventType}, from eventQueue.")
+                except queue.Empty:
+                    # check if we're finished
+                    if self.threadsFinished(log_status):
+                        sleep(.1)
+                        # but are we really?
+                        if self.threadsFinished(log_status):
+                            if final_passes < 1:
+                                break
+                            # Trigger module.finished()
+                            for mod in self.__moduleInstances.values():
+                                if not mod.errorState and mod.incomingEventQueue is not None:
+                                    mod.incomingEventQueue.put('FINISHED')
+                            sleep(.1)
+                            while not self.threadsFinished(log_status):
+                                log_status = counter % 100 == 0
+                                counter += 1
+                                sleep(.01)
+                            final_passes -= 1
+
+                    else:
+                        # save on CPU
+                        sleep(.1)
+                    continue
+
+                if not isinstance(sfEvent, SpiderFootEvent):
+                    raise TypeError(f"sfEvent is {type(sfEvent)}; expected SpiderFootEvent")
+
+                # for every module
+                for mod in self.__moduleInstances.values():
+                    # if it's been aborted
+                    if mod._stopScanning:
+                        # break out of the while loop
+                        raise AssertionError(f"{mod.__name__} requested stop")
+
+                    # send it the new event if applicable
+                    if not mod.errorState and mod.incomingEventQueue is not None:
+                        watchedEvents = mod.watchedEvents()
+                        if sfEvent.eventType in watchedEvents or "*" in watchedEvents:
+                            mod.incomingEventQueue.put(deepcopy(sfEvent))
+
+        finally:
+            # tell the modules to stop
+            for mod in self.__moduleInstances.values():
+                mod._stopScanning = True
+            self.__sharedThreadPool.shutdown(wait=True)
+
+    def threadsFinished(self, log_status=False):
+        if self.eventQueue is None:
+            return True
+
+        modules_waiting = dict()
+        for m in self.__moduleInstances.values():
+            try:
+                if m.incomingEventQueue is not None:
+                    modules_waiting[m.__name__] = m.incomingEventQueue.qsize()
+            except Exception:
+                with suppress(Exception):
+                    m.errorState = True
+        modules_waiting = sorted(modules_waiting.items(), key=lambda x: x[-1], reverse=True)
+
+        modules_running = []
+        for m in self.__moduleInstances.values():
+            try:
+                if m.running:
+                    modules_running.append(m.__name__)
+            except Exception:
+                with suppress(Exception):
+                    m.errorState = True
+
+        modules_errored = []
+        for m in self.__moduleInstances.values():
+            try:
+                if m.errorState:
+                    modules_errored.append(m.__name__)
+            except Exception:
+                with suppress(Exception):
+                    m.errorState = True
+
+        queues_empty = [qsize == 0 for m, qsize in modules_waiting]
+
+        for mod in self.__moduleInstances.values():
+            if mod.errorState and mod.incomingEventQueue is not None:
+                self.__sf.debug(f"Clearing and unsetting incomingEventQueue for errored module {mod.__name__}.")
+                with suppress(Exception):
+                    while 1:
+                        mod.incomingEventQueue.get_nowait()
+                mod.incomingEventQueue = None
+
+        if not modules_running and not queues_empty:
+            self.__sf.debug("Clearing queues for stalled/aborted modules.")
+            for mod in self.__moduleInstances.values():
+                try:
+                    while True:
+                        mod.incomingEventQueue.get_nowait()
+                except Exception:
+                    pass
+
+        if log_status:
+            events_queued = ", ".join([f"{mod}: {qsize:,}" for mod, qsize in modules_waiting[:5] if qsize > 0])
+            if not events_queued:
+                events_queued = 'None'
+            self.__sf.debug(f"Events queued: {sum([m[-1] for m in modules_waiting]):,} ({events_queued})")
+            if modules_running:
+                self.__sf.debug(f"Modules running: {len(modules_running):,} ({', '.join(modules_running)})")
+            if modules_errored:
+                self.__sf.debug(f"Modules errored: {len(modules_errored):,} ({', '.join(modules_errored)})")
+
+        if all(queues_empty) and not modules_running:
+            return True
+        return False

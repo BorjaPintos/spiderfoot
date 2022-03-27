@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # -------------------------------------------------------------------------------
 # Name:         sfp_phishtank
-# Purpose:      Checks if an ASN, IP or domain is malicious.
+# Purpose:      Check if a host/domain is malicious according to PhishTank.
 #
 # Author:       steve@binarypool.com
 #
@@ -10,251 +10,189 @@
 # Licence:     GPL
 # -------------------------------------------------------------------------------
 
-from netaddr import IPAddress, IPNetwork
-import re
-from sflib import SpiderFoot, SpiderFootPlugin, SpiderFootEvent
-
-malchecks = {
-    'PhishTank': {
-        'id': '_phishtank',
-        'type': 'list',
-        'checks': ['domain'],
-        'url': 'http://data.phishtank.com/data/online-valid.csv',
-        'regex': '\d+,\w+://(.*\.)?[^a-zA-Z0-9]?{0}.*,http://www.phishtank.com/.*'
-    }
-}
+from spiderfoot import SpiderFootEvent, SpiderFootPlugin
 
 
 class sfp_phishtank(SpiderFootPlugin):
-    """PhishTank:Investigate,Passive:Reputation Systems::Check if a host/domain is malicious according to PhishTank."""
 
+    meta = {
+        'name': "PhishTank",
+        'summary': "Check if a host/domain is malicious according to PhishTank.",
+        'flags': [],
+        'useCases': ["Investigate", "Passive"],
+        'categories': ["Reputation Systems"],
+        'dataSource': {
+            'website': "https://phishtank.com/",
+            'model': "FREE_NOAUTH_UNLIMITED",
+            'references': [
+                "https://phishtank.com/developer_info.php"
+            ],
+            'favIcon': "https://www.google.com/s2/favicons?domain=https://phishtank.com/",
+            'logo': "https://phishtank.com/images/logo_with_tagline.gif",
+            'description': "Submit suspected phishes. Track the status of your submissions. Verify other users' submissions.",
+        }
+    }
 
-    # Default options
     opts = {
-        '_phishtank': True,
-        'checkaffiliates': True,  
+        'checkaffiliates': True,
         'checkcohosts': True,
         'cacheperiod': 18
     }
 
-    # Option descriptions
     optdescs = {
         'checkaffiliates': "Apply checks to affiliates?",
         'checkcohosts': "Apply checks to sites found to be co-hosted on the target's IP?",
         'cacheperiod': "Hours to cache list data before re-fetching."
     }
 
-    # Be sure to completely clear any class variables in setup()
-    # or you run the risk of data persisting between scan runs.
-
-    results = dict()
+    results = None
+    errorState = False
 
     def setup(self, sfc, userOpts=dict()):
         self.sf = sfc
-        self.results = dict()
+        self.results = self.tempStorage()
+        self.errorState = False
 
-        # Clear / reset any other class member variables here
-        # or you risk them persisting between threads.
-
-        for opt in userOpts.keys():
+        for opt in list(userOpts.keys()):
             self.opts[opt] = userOpts[opt]
 
-    # What events is this module interested in for input
-    # * = be notified about all events.
     def watchedEvents(self):
-        return ["INTERNET_NAME", "AFFILIATE_INTERNET_NAME", "CO_HOSTED_SITE"]
+        return [
+            "INTERNET_NAME",
+            "AFFILIATE_INTERNET_NAME",
+            "CO_HOSTED_SITE",
+        ]
 
-    # What events this module produces
-    # This is to support the end user in selecting modules based on events
-    # produced.
     def producedEvents(self):
-        return ["MALICIOUS_INTERNET_NAME", "MALICIOUS_AFFILIATE_INTERNET_NAME", 
-                "MALICIOUS_COHOST"]
+        return [
+            "BLACKLISTED_INTERNET_NAME",
+            "BLACKLISTED_AFFILIATE_INTERNET_NAME",
+            "BLACKLISTED_COHOST",
+            "MALICIOUS_INTERNET_NAME",
+            "MALICIOUS_AFFILIATE_INTERNET_NAME",
+            "MALICIOUS_COHOST",
+        ]
 
-    # Check the regexps to see whether the content indicates maliciousness
-    def contentMalicious(self, content, goodregex, badregex):
-        # First, check for the bad indicators
-        if len(badregex) > 0:
-            for rx in badregex:
-                if re.match(rx, content, re.IGNORECASE | re.DOTALL):
-                    self.sf.debug("Found to be bad against bad regex: " + rx)
-                    return True
+    def queryBlacklist(self, target):
+        blacklist = self.retrieveBlacklist()
 
-        # Finally, check for good indicators
-        if len(goodregex) > 0:
-            for rx in goodregex:
-                if re.match(rx, content, re.IGNORECASE | re.DOTALL):
-                    self.sf.debug("Found to be good againt good regex: " + rx)
-                    return False
+        if not blacklist:
+            return False
 
-        # If nothing was matched, reply None
-        self.sf.debug("Neither good nor bad, unknown.")
-        return None
-
-    # Look up 'query' type sources
-    def resourceQuery(self, id, target, targetType):
-        self.sf.debug("Querying " + id + " for maliciousness of " + target)
-        for check in malchecks.keys():
-            cid = malchecks[check]['id']
-            if id == cid and malchecks[check]['type'] == "query":
-                url = unicode(malchecks[check]['url'])
-                res = self.sf.fetchUrl(url.format(target), timeout=self.opts['_fetchtimeout'], useragent=self.opts['_useragent'])
-                if res['content'] is None:
-                    self.sf.error("Unable to fetch " + url.format(target), False)
-                    return None
-                if self.contentMalicious(res['content'],
-                                         malchecks[check]['goodregex'],
-                                         malchecks[check]['badregex']):
-                    return url.format(target)
+        for item in blacklist:
+            if not item:
+                continue
+            if target.lower() in item[1]:
+                self.debug(f"Host name {target} found in phishtank.com blacklist.")
+                return item[0]
 
         return None
 
-    # Look up 'list' type resources
-    def resourceList(self, id, target, targetType):
-        targetDom = ''
-        # Get the base domain if we're supplied a domain
-        if targetType == "domain":
-            targetDom = self.sf.hostDomain(target, self.opts['_internettlds'])
+    def retrieveBlacklist(self):
+        blacklist = self.sf.cacheGet('phishtank', 24)
 
-        for check in malchecks.keys():
-            cid = malchecks[check]['id']
-            if id == cid and malchecks[check]['type'] == "list":
-                data = dict()
-                url = malchecks[check]['url']
-                data['content'] = self.sf.cacheGet("sfmal_" + cid, self.opts.get('cacheperiod', 0))
-                if data['content'] is None:
-                    data = self.sf.fetchUrl(url, timeout=self.opts['_fetchtimeout'], useragent=self.opts['_useragent'])
-                    if data['content'] is None:
-                        self.sf.error("Unable to fetch " + url, False)
-                        return None
-                    else:
-                        self.sf.cachePut("sfmal_" + cid, data['content'])
+        if blacklist is not None:
+            return self.parseBlacklist(blacklist)
 
-                # If we're looking at netblocks
-                if targetType == "netblock":
-                    iplist = list()
-                    # Get the regex, replace {0} with an IP address matcher to 
-                    # build a list of IP.
-                    # Cycle through each IP and check if it's in the netblock.
-                    if 'regex' in malchecks[check]:
-                        rx = malchecks[check]['regex'].replace("{0}",
-                                                               "(\d+\.\d+\.\d+\.\d+)")
-                        pat = re.compile(rx, re.IGNORECASE)
-                        self.sf.debug("New regex for " + check + ": " + rx)
-                        for line in data['content'].split('\n'):
-                            grp = re.findall(pat, line)
-                            if len(grp) > 0:
-                                #self.sf.debug("Adding " + grp[0] + " to list.")
-                                iplist.append(grp[0])
-                    else:
-                        iplist = data['content'].split('\n')
+        res = self.sf.fetchUrl(
+            "https://data.phishtank.com/data/online-valid.csv",
+            timeout=self.opts['_fetchtimeout'],
+            useragent="SpiderFoot",
+        )
 
-                    for ip in iplist:
-                        if len(ip) < 8 or ip.startswith("#"):
-                            continue
-                        ip = ip.strip()
+        if res['code'] != "200":
+            self.error(f"Unexpected HTTP response code {res['code']} from phishtank.com.")
+            self.errorState = True
+            return None
 
-                        try:
-                            if IPAddress(ip) in IPNetwork(target):
-                                self.sf.debug(ip + " found within netblock/subnet " +
-                                              target + " in " + check)
-                                return url
-                        except Exception as e:
-                            self.sf.debug("Error encountered parsing: " + str(e))
-                            continue
+        if res['content'] is None:
+            self.error("Received no content from phishtank.com")
+            self.errorState = True
+            return None
 
-                    return None
+        self.sf.cachePut("phishtank", res['content'])
 
-                # If we're looking at hostnames/domains/IPs
-                if 'regex' not in malchecks[check]:
-                    for line in data['content'].split('\n'):
-                        if line == target or (targetType == "domain" and line == targetDom):
-                            self.sf.debug(target + "/" + targetDom + " found in " + check + " list.")
-                            return url
-                else:
-                    # Check for the domain and the hostname
-                    try:
-                        rxDom = unicode(malchecks[check]['regex']).format(targetDom)
-                        rxTgt = unicode(malchecks[check]['regex']).format(target)
-                        for line in data['content'].split('\n'):
-                            if (targetType == "domain" and re.match(rxDom, line, re.IGNORECASE)) or \
-                                    re.match(rxTgt, line, re.IGNORECASE):
-                                self.sf.debug(target + "/" + targetDom + " found in " + check + " list.")
-                                return url
-                    except BaseException as e:
-                        self.sf.debug("Error encountered parsing 2: " + str(e))
-                        continue
+        return self.parseBlacklist(res['content'])
 
-        return None
+    def parseBlacklist(self, blacklist):
+        """Parse plaintext blacklist
 
-    def lookupItem(self, resourceId, itemType, target):
-        for check in malchecks.keys():
-            cid = malchecks[check]['id']
-            if cid == resourceId and itemType in malchecks[check]['checks']:
-                self.sf.debug("Checking maliciousness of " + target + " (" +
-                              itemType + ") with: " + cid)
-                if malchecks[check]['type'] == "query":
-                    return self.resourceQuery(cid, target, itemType)
-                if malchecks[check]['type'] == "list":
-                    return self.resourceList(cid, target, itemType)
+        Args:
+            blacklist (str): plaintext blacklist from phishtank.com
 
-        return None
+        Returns:
+            list: list of blacklisted host names and associated PhishTank IDs
+        """
+        hosts = list()
 
-    # Handle events sent to this module
+        if not blacklist:
+            return hosts
+
+        for line in blacklist.split('\n'):
+            if not line:
+                continue
+            if line.startswith('#'):
+                continue
+            phish_id = line.strip().split(",")[0]
+            url = str(line.strip().split(",")[1]).lower()
+            # Note: URL parsing and validation with sf.validHost() is too slow to use here
+            if len(url.split("/")) < 3:
+                continue
+            host = url.split("/")[2]
+            if not host:
+                continue
+            if "." not in host:
+                continue
+            hosts.append([phish_id, host])
+
+        return hosts
+
     def handleEvent(self, event):
         eventName = event.eventType
-        srcModuleName = event.module
         eventData = event.data
 
-        self.sf.debug("Received event, " + eventName + ", from " + srcModuleName)
+        self.debug(f"Received event, {eventName}, from {event.module}")
 
         if eventData in self.results:
-            self.sf.debug("Skipping " + eventData + ", already checked.")
-            return None
+            self.debug(f"Skipping {eventData}, already checked.")
+            return
+
+        if self.errorState:
+            return
+
+        self.results[eventData] = True
+
+        if eventName == "INTERNET_NAME":
+            malicious_type = "MALICIOUS_INTERNET_NAME"
+            blacklist_type = "BLACKLISTED_INTERNET_NAME"
+        elif eventName == "AFFILIATE_INTERNET_NAME":
+            if not self.opts.get('checkaffiliates', False):
+                return
+            malicious_type = "MALICIOUS_AFFILIATE_INTERNET_NAME"
+            blacklist_type = "BLACKLISTED_AFFILIATE_INTERNET_NAME"
+        elif eventName == "CO_HOSTED_SITE":
+            if not self.opts.get('checkcohosts', False):
+                return
+            malicious_type = "MALICIOUS_COHOST"
+            blacklist_type = "BLACKLISTED_COHOST"
         else:
-            self.results[eventData] = True
+            self.debug(f"Unexpected event type {eventName}, skipping")
+            return
 
-        if eventName == 'CO_HOSTED_SITE' and not self.opts.get('checkcohosts', False):
-            return None
-        if eventName == 'AFFILIATE_IPADDR' \
-                and not self.opts.get('checkaffiliates', False):
-            return None
+        self.debug(f"Checking maliciousness of {eventData} ({eventName}) with phishtank.com")
 
-        for check in malchecks.keys():
-            cid = malchecks[check]['id']
-            # If the module is enabled..
-            if self.opts[cid]:
-                if eventName in ['IP_ADDRESS', 'AFFILIATE_IPADDR']:
-                    typeId = 'ip'
-                    if eventName == 'IP_ADDRESS':
-                        evtType = 'MALICIOUS_IPADDR'
-                    else:
-                        evtType = 'MALICIOUS_AFFILIATE_IPADDR'
+        phish_id = self.queryBlacklist(eventData)
 
-                if eventName in ['BGP_AS_OWNER', 'BGP_AS_MEMBER']:
-                    typeId = 'asn'
-                    evtType = 'MALICIOUS_ASN'
+        if not phish_id:
+            return
 
-                if eventName in ['INTERNET_NAME', 'CO_HOSTED_SITE',
-                                 'AFFILIATE_INTERNET_NAME', ]:
-                    typeId = 'domain'
-                    if eventName == "INTERNET_NAME":
-                        evtType = "MALICIOUS_INTERNET_NAME"
-                    if eventName == 'AFFILIATE_INTERNET_NAME':
-                        evtType = 'MALICIOUS_AFFILIATE_INTERNET_NAME'
-                    if eventName == 'CO_HOSTED_SITE':
-                        evtType = 'MALICIOUS_COHOST'
+        url = f"https://www.phishtank.com/phish_detail.php?phish_id={phish_id}"
+        text = f"PhishTank [{eventData}]\n<SFURL>{url}</SFURL>"
 
-                url = self.lookupItem(cid, typeId, eventData)
-                if self.checkForStop():
-                    return None
+        evt = SpiderFootEvent(malicious_type, text, self.__name__, event)
+        self.notifyListeners(evt)
 
-                # Notify other modules of what you've found
-                if url is not None:
-                    text = check + " [" + eventData + "]\n" + "<SFURL>" + url + "</SFURL>"
-                    evt = SpiderFootEvent(evtType, text, self.__name__, event)
-                    self.notifyListeners(evt)
-
-        return None
+        evt = SpiderFootEvent(blacklist_type, text, self.__name__, event)
+        self.notifyListeners(evt)
 
 # End of sfp_phishtank class

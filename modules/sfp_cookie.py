@@ -10,23 +10,32 @@
 # Licence:     GPL
 # -------------------------------------------------------------------------------
 
-from sflib import SpiderFoot, SpiderFootPlugin, SpiderFootEvent
+import json
+
+from spiderfoot import SpiderFootEvent, SpiderFootPlugin
 
 
 class sfp_cookie(SpiderFootPlugin):
-    """Cookies:Footprint,Investigate:Crawling and Scanning::Extract Cookies from HTTP headers."""
 
+    meta = {
+        'name': "Cookie Extractor",
+        'summary': "Extract Cookies from HTTP headers.",
+        'flags': [],
+        'useCases': ["Footprint", "Investigate", "Passive"],
+        'categories': ["Content Analysis"]
+    }
 
-    # Default options
     opts = {}
+    optdescs = {}
 
-    results = dict()
+    results = None
 
     def setup(self, sfc, userOpts=dict()):
         self.sf = sfc
-        self.results = dict()
+        self.results = self.tempStorage()
+        self.__dataSource__ = "Target Website"
 
-        for opt in userOpts.keys():
+        for opt in list(userOpts.keys()):
             self.opts[opt] = userOpts[opt]
 
     # What events is this module interested in for input
@@ -34,8 +43,6 @@ class sfp_cookie(SpiderFootPlugin):
         return ["WEBSERVER_HTTPHEADERS"]
 
     # What events this module produces
-    # This is to support the end user in selecting modules based on events
-    # produced.
     def producedEvents(self):
         return ["TARGET_WEB_COOKIE"]
 
@@ -44,22 +51,29 @@ class sfp_cookie(SpiderFootPlugin):
         eventName = event.eventType
         srcModuleName = event.module
         eventData = event.data
-        parentEvent = event.sourceEvent
-        eventSource = event.sourceEvent.data
+        eventSource = event.actualSource
 
-        self.sf.debug("Received event, " + eventName + ", from " + srcModuleName)
+        self.debug(f"Received event, {eventName}, from {srcModuleName}")
+
         if eventSource in self.results:
-            return None
-        else:
-            self.results[eventSource] = True
+            return
 
-        if not self.getTarget().matches(self.sf.urlFQDN(eventSource)):
-            self.sf.debug("Not collecting cookies from external sites.")
-            return None
+        self.results[eventSource] = True
 
-        if 'set-cookie' in eventData:
-            evt = SpiderFootEvent("TARGET_WEB_COOKIE", eventData['set-cookie'],
-                                  self.__name__, parentEvent)
+        fqdn = self.sf.urlFQDN(eventSource)
+        if not self.getTarget().matches(fqdn):
+            self.debug(f"Not collecting cookies from external sites. Ignoring HTTP headers from {fqdn}")
+            return
+
+        try:
+            data = json.loads(eventData)
+        except Exception:
+            self.error("Received HTTP headers from another module in an unexpected format.")
+            return
+
+        cookie = data.get('cookie')
+        if cookie:
+            evt = SpiderFootEvent("TARGET_WEB_COOKIE", cookie, self.__name__, event)
             self.notifyListeners(evt)
 
 # End of sfp_cookie class

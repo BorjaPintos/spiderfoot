@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # -------------------------------------------------------------------------------
 # Name:         sfp_coinblocker
-# Purpose:      Checks if an IP, hostname or domain is malicious.
+# Purpose:      Checks if a hostname is listed on CoinBlockerLists.
 #
 # Author:       steve@binarypool.com
 #
@@ -10,274 +10,187 @@
 # Licence:     GPL
 # -------------------------------------------------------------------------------
 
-from netaddr import IPAddress, IPNetwork
-import re
-from sflib import SpiderFoot, SpiderFootPlugin, SpiderFootEvent
+from spiderfoot import SpiderFootEvent, SpiderFootPlugin
 
-malchecks = {
-    'CoinBlocker IP List': {
-        'id': 'coinip',
-        'type': 'list',
-        'checks': ['ip', 'netblock'],
-        'url': 'https://zerodot1.gitlab.io/CoinBlockerLists/MiningServerIPList.txt',
-        'regex': '^{0}$'
-    },
-    'CoinBlocker Domain List': {
-        'id': 'coindom',
-        'type': 'list',
-        'checks': ['domain'],
-        'url': 'https://zerodot1.gitlab.io/CoinBlockerLists/list.txt',
-        'regex': '^{0}$'
-    }
-}
 
 class sfp_coinblocker(SpiderFootPlugin):
-    """CoinBlocker Lists:Investigate,Passive:Reputation Systems::Check if a host/domain or IP appears on CoinBlocker lists."""
 
+    meta = {
+        'name': "CoinBlocker Lists",
+        'summary': "Check if a domain appears on CoinBlocker lists.",
+        'flags': [],
+        'useCases': ["Investigate", "Passive"],
+        'categories': ["Reputation Systems"],
+        'dataSource': {
+            'website': "https://zerodot1.gitlab.io/CoinBlockerListsWeb/",
+            'model': "FREE_NOAUTH_UNLIMITED",
+            'references': [
+                "https://zerodot1.gitlab.io/CoinBlockerListsWeb/downloads.html",
+                "https://zerodot1.gitlab.io/CoinBlockerListsWeb/references.html",
+                "https://zerodot1.gitlab.io/CoinBlockerListsWeb/aboutthisproject.html"
+            ],
+            'favIcon': "https://zerodot1.gitlab.io/CoinBlockerListsWeb/assets/img/favicon.png",
+            'logo': "https://zerodot1.gitlab.io/CoinBlockerListsWeb/assets/img/favicon.png",
+            'description': "The CoinBlockerLists are a project to prevent illegal mining in "
+            "browsers or other applications using IPlists and URLLists.\n"
+            "It's not just to block everything without any reason, but to protect "
+            "Internet users from illegal mining.",
+        }
+    }
 
-    # Default options
     opts = {
-        'coinip': True,
-        'coindom': True,
         'checkaffiliates': True,
         'checkcohosts': True,
         'cacheperiod': 18,
-        'checknetblocks': True,
-        'checksubnets': True
     }
 
-    # Option descriptions
     optdescs = {
-        'coinip': "Enable CoinBlocker IP check?",
-        'coindom': "Enable CoinBlocker Domains check?",
         'checkaffiliates': "Apply checks to affiliates?",
         'checkcohosts': "Apply checks to sites found to be co-hosted on the target's IP?",
         'cacheperiod': "Hours to cache list data before re-fetching.",
-        'checknetblocks': "Report if any malicious IPs are found within owned netblocks?",
-        'checksubnets': "Check if any malicious IPs are found within the same subnet of the target?"
     }
 
-    # Be sure to completely clear any class variables in setup()
-    # or you run the risk of data persisting between scan runs.
-
-    results = dict()
+    results = None
+    errorState = False
 
     def setup(self, sfc, userOpts=dict()):
         self.sf = sfc
-        self.results = dict()
+        self.errorState = False
+        self.results = self.tempStorage()
 
-        # Clear / reset any other class member variables here
-        # or you risk them persisting between threads.
-
-        for opt in userOpts.keys():
+        for opt in list(userOpts.keys()):
             self.opts[opt] = userOpts[opt]
 
-    # What events is this module interested in for input
-    # * = be notified about all events.
     def watchedEvents(self):
-        return ["INTERNET_NAME", "IP_ADDRESS",
-                "NETBLOCK_MEMBER", "AFFILIATE_INTERNET_NAME", "AFFILIATE_IPADDR",
-                "CO_HOSTED_SITE", "NETBLOCK_OWNER"]
+        return [
+            "INTERNET_NAME",
+            "AFFILIATE_INTERNET_NAME",
+            "CO_HOSTED_SITE",
+        ]
 
-    # What events this module produces
-    # This is to support the end user in selecting modules based on events
-    # produced.
     def producedEvents(self):
-        return ["MALICIOUS_IPADDR", "MALICIOUS_INTERNET_NAME",
-                "MALICIOUS_AFFILIATE_IPADDR", "MALICIOUS_AFFILIATE_INTERNET_NAME",
-                "MALICIOUS_SUBNET", "MALICIOUS_COHOST", "MALICIOUS_NETBLOCK"]
+        return [
+            "BLACKLISTED_INTERNET_NAME",
+            "BLACKLISTED_AFFILIATE_INTERNET_NAME",
+            "BLACKLISTED_COHOST",
+            "MALICIOUS_INTERNET_NAME",
+            "MALICIOUS_AFFILIATE_INTERNET_NAME",
+            "MALICIOUS_COHOST",
+        ]
 
-    # Check the regexps to see whether the content indicates maliciousness
-    def contentMalicious(self, content, goodregex, badregex):
-        # First, check for the bad indicators
-        if len(badregex) > 0:
-            for rx in badregex:
-                if re.match(rx, content, re.IGNORECASE | re.DOTALL):
-                    self.sf.debug("Found to be bad against bad regex: " + rx)
-                    return True
+    def queryBlocklist(self, target):
+        blocklist = self.retrieveBlocklist()
 
-        # Finally, check for good indicators
-        if len(goodregex) > 0:
-            for rx in goodregex:
-                if re.match(rx, content, re.IGNORECASE | re.DOTALL):
-                    self.sf.debug("Found to be good againt good regex: " + rx)
-                    return False
+        if not blocklist:
+            return False
 
-        # If nothing was matched, reply None
-        self.sf.debug("Neither good nor bad, unknown.")
-        return None
+        if target.lower() in blocklist:
+            self.debug(f"Host name {target} found in CoinBlocker list.")
+            return True
 
-    # Look up 'query' type sources
-    def resourceQuery(self, id, target, targetType):
-        self.sf.debug("Querying " + id + " for maliciousness of " + target)
-        for check in malchecks.keys():
-            cid = malchecks[check]['id']
-            if id == cid and malchecks[check]['type'] == "query":
-                url = unicode(malchecks[check]['url'])
-                res = self.sf.fetchUrl(url.format(target), timeout=self.opts['_fetchtimeout'], useragent=self.opts['_useragent'])
-                if res['content'] is None:
-                    self.sf.error("Unable to fetch " + url.format(target), False)
-                    return None
-                if self.contentMalicious(res['content'],
-                                         malchecks[check]['goodregex'],
-                                         malchecks[check]['badregex']):
-                    return url.format(target)
+        return False
 
-        return None
+    def retrieveBlocklist(self):
+        blocklist = self.sf.cacheGet('coinblocker', self.opts.get('cacheperiod', 24))
 
-    # Look up 'list' type resources
-    def resourceList(self, id, target, targetType):
-        targetDom = ''
-        # Get the base domain if we're supplied a domain
-        if targetType == "domain":
-            targetDom = self.sf.hostDomain(target, self.opts['_internettlds'])
+        if blocklist is not None:
+            return self.parseBlocklist(blocklist)
 
-        for check in malchecks.keys():
-            cid = malchecks[check]['id']
-            if id == cid and malchecks[check]['type'] == "list":
-                data = dict()
-                url = malchecks[check]['url']
-                data['content'] = self.sf.cacheGet("sfmal_" + cid, self.opts.get('cacheperiod', 0))
-                if data['content'] is None:
-                    data = self.sf.fetchUrl(url, timeout=self.opts['_fetchtimeout'], useragent=self.opts['_useragent'])
-                    if data['content'] is None:
-                        self.sf.error("Unable to fetch " + url, False)
-                        return None
-                    else:
-                        self.sf.cachePut("sfmal_" + cid, data['content'])
+        url = "https://zerodot1.gitlab.io/CoinBlockerLists/list.txt"
+        res = self.sf.fetchUrl(
+            url,
+            timeout=self.opts['_fetchtimeout'],
+            useragent=self.opts['_useragent'],
+        )
 
-                # If we're looking at netblocks
-                if targetType == "netblock":
-                    iplist = list()
-                    # Get the regex, replace {0} with an IP address matcher to 
-                    # build a list of IP.
-                    # Cycle through each IP and check if it's in the netblock.
-                    if 'regex' in malchecks[check]:
-                        rx = malchecks[check]['regex'].replace("{0}",
-                                                               "(\d+\.\d+\.\d+\.\d+)")
-                        pat = re.compile(rx, re.IGNORECASE)
-                        self.sf.debug("New regex for " + check + ": " + rx)
-                        for line in data['content'].split('\n'):
-                            grp = re.findall(pat, line)
-                            if len(grp) > 0:
-                                #self.sf.debug("Adding " + grp[0] + " to list.")
-                                iplist.append(grp[0])
-                    else:
-                        iplist = data['content'].split('\n')
+        if res['code'] != "200":
+            self.error(f"Unexpected HTTP response code {res['code']} from {url}")
+            self.errorState = True
+            return None
 
-                    for ip in iplist:
-                        if len(ip) < 8 or ip.startswith("#"):
-                            continue
-                        ip = ip.strip()
+        if res['content'] is None:
+            self.error(f"Received no content from {url}")
+            self.errorState = True
+            return None
 
-                        try:
-                            if IPAddress(ip) in IPNetwork(target):
-                                self.sf.debug(ip + " found within netblock/subnet " +
-                                              target + " in " + check)
-                                return url
-                        except Exception as e:
-                            self.sf.debug("Error encountered parsing: " + str(e))
-                            continue
+        self.sf.cachePut("coinblocker", res['content'])
 
-                    return None
+        return self.parseBlocklist(res['content'])
 
-                # If we're looking at hostnames/domains/IPs
-                if 'regex' not in malchecks[check]:
-                    for line in data['content'].split('\n'):
-                        if line == target or (targetType == "domain" and line == targetDom):
-                            self.sf.debug(target + "/" + targetDom + " found in " + check + " list.")
-                            return url
-                else:
-                    try:
-                    # Check for the domain and the hostname
-                        rxDom = unicode(malchecks[check]['regex']).format(targetDom)
-                        rxTgt = unicode(malchecks[check]['regex']).format(target)
-                        for line in data['content'].split('\n'):
-                            if (targetType == "domain" and re.match(rxDom, line, re.IGNORECASE)) or \
-                                    re.match(rxTgt, line, re.IGNORECASE):
-                                self.sf.debug(target + "/" + targetDom + " found in " + check + " list.")
-                                return url
-                    except BaseException as e:
-                        self.sf.debug("Error encountered parsing 2: " + str(e))
-                        continue
+    def parseBlocklist(self, blocklist):
+        """Parse plaintext CoinBlocker list
 
-        return None
+        Args:
+            blocklist (str): plaintext CoinBlocker list
 
-    def lookupItem(self, resourceId, itemType, target):
-        for check in malchecks.keys():
-            cid = malchecks[check]['id']
-            if cid == resourceId and itemType in malchecks[check]['checks']:
-                self.sf.debug("Checking maliciousness of " + target + " (" +
-                              itemType + ") with: " + cid)
-                if malchecks[check]['type'] == "query":
-                    return self.resourceQuery(cid, target, itemType)
-                if malchecks[check]['type'] == "list":
-                    return self.resourceList(cid, target, itemType)
+        Returns:
+            list: list of blocked host names
+        """
+        hosts = list()
 
-        return None
+        if not blocklist:
+            return hosts
 
-    # Handle events sent to this module
+        for line in blocklist.split('\n'):
+            if not line:
+                continue
+            if line.startswith('#'):
+                continue
+            host = line.strip()
+            # Note: Validation with sf.validHost() is too slow to use here
+            # if not self.sf.validHost(host, self.opts['_internettlds']):
+            #    continue
+            if not host:
+                continue
+            hosts.append(host.lower())
+
+        return hosts
+
     def handleEvent(self, event):
         eventName = event.eventType
         srcModuleName = event.module
         eventData = event.data
 
-        self.sf.debug("Received event, " + eventName + ", from " + srcModuleName)
+        self.debug(f"Received event, {eventName}, from {srcModuleName}")
 
         if eventData in self.results:
-            self.sf.debug("Skipping " + eventData + ", already checked.")
-            return None
+            self.debug(f"Skipping {eventData}, already checked.")
+            return
+
+        if self.errorState:
+            return
+
+        self.results[eventData] = True
+
+        if eventName == "INTERNET_NAME":
+            malicious_type = "MALICIOUS_INTERNET_NAME"
+            blacklist_type = "BLACKLISTED_INTERNET_NAME"
+        elif eventName == "AFFILIATE_INTERNET_NAME":
+            if not self.opts.get('checkaffiliates', False):
+                return
+            malicious_type = "MALICIOUS_AFFILIATE_INTERNET_NAME"
+            blacklist_type = "BLACKLISTED_AFFILIATE_INTERNET_NAME"
+        elif eventName == "CO_HOSTED_SITE":
+            if not self.opts.get('checkcohosts', False):
+                return
+            malicious_type = "MALICIOUS_COHOST"
+            blacklist_type = "BACKLISTED_COHOST"
         else:
-            self.results[eventData] = True
+            self.debug(f"Unexpected event type {eventName}, skipping")
+            return
 
-        if eventName == 'CO_HOSTED_SITE' and not self.opts.get('checkcohosts', False):
-            return None
-        if eventName == 'AFFILIATE_IPADDR' \
-                and not self.opts.get('checkaffiliates', False):
-            return None
-        if eventName == 'NETBLOCK_OWNER' and not self.opts.get('checknetblocks', False):
-            return None
-        if eventName == 'NETBLOCK_MEMBER' and not self.opts.get('checksubnets', False):
-            return None
+        self.debug(f"Checking maliciousness of {eventData} ({eventName}) with CoinBlocker list")
 
-        for check in malchecks.keys():
-            cid = malchecks[check]['id']
-            # If the module is enabled..
-            if self.opts[cid]:
-                if eventName in ['IP_ADDRESS', 'AFFILIATE_IPADDR']:
-                    typeId = 'ip'
-                    if eventName == 'IP_ADDRESS':
-                        evtType = 'MALICIOUS_IPADDR'
-                    else:
-                        evtType = 'MALICIOUS_AFFILIATE_IPADDR'
+        if not self.queryBlocklist(eventData):
+            return
 
-                if eventName in ['INTERNET_NAME', 'CO_HOSTED_SITE',
-                                 'AFFILIATE_INTERNET_NAME', ]:
-                    typeId = 'domain'
-                    if eventName == "INTERNET_NAME":
-                        evtType = "MALICIOUS_INTERNET_NAME"
-                    if eventName == 'AFFILIATE_INTERNET_NAME':
-                        evtType = 'MALICIOUS_AFFILIATE_INTERNET_NAME'
-                    if eventName == 'CO_HOSTED_SITE':
-                        evtType = 'MALICIOUS_COHOST'
+        url = "https://zerodot1.gitlab.io/CoinBlockerLists/list.txt"
+        text = f"CoinBlocker [{eventData}]\n<SFURL>{url}</SFURL>"
 
-                if eventName == 'NETBLOCK_OWNER':
-                    typeId = 'netblock'
-                    evtType = 'MALICIOUS_NETBLOCK'
-                if eventName == 'NETBLOCK_MEMBER':
-                    typeId = 'netblock'
-                    evtType = 'MALICIOUS_SUBNET'
+        evt = SpiderFootEvent(malicious_type, text, self.__name__, event)
+        self.notifyListeners(evt)
 
-                url = self.lookupItem(cid, typeId, eventData)
-                if self.checkForStop():
-                    return None
-
-                # Notify other modules of what you've found
-                if url is not None:
-                    text = check + " [" + eventData + "]\n" + "<SFURL>" + url + "</SFURL>"
-                    evt = SpiderFootEvent(evtType, text, self.__name__, event)
-                    self.notifyListeners(evt)
-
-        return None
+        evt = SpiderFootEvent(blacklist_type, text, self.__name__, event)
+        self.notifyListeners(evt)
 
 # End of sfp_coinblocker class

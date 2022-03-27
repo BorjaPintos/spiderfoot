@@ -11,13 +11,22 @@
 # Licence:     GPL
 # -------------------------------------------------------------------------------
 
-import whois
 import ipwhois
-from netaddr import IPAddress
-from sflib import SpiderFoot, SpiderFootPlugin, SpiderFootEvent
+import netaddr
+import whois
+
+from spiderfoot import SpiderFootEvent, SpiderFootPlugin
+
 
 class sfp_whois(SpiderFootPlugin):
-    """Whois:Footprint,Investigate,Passive:Public Registries::Perform a WHOIS look-up on domain names and owned netblocks."""
+
+    meta = {
+        'name': "Whois",
+        'summary': "Perform a WHOIS look-up on domain names and owned netblocks.",
+        'flags': [],
+        'useCases': ["Footprint", "Investigate", "Passive"],
+        'categories': ["Public Registries"]
+    }
 
     # Default options
     opts = {
@@ -27,19 +36,19 @@ class sfp_whois(SpiderFootPlugin):
     optdescs = {
     }
 
-    results = dict()
+    results = None
 
     def setup(self, sfc, userOpts=dict()):
         self.sf = sfc
-        self.results = dict()
+        self.results = self.tempStorage()
 
-        for opt in userOpts.keys():
+        for opt in list(userOpts.keys()):
             self.opts[opt] = userOpts[opt]
 
     # What events is this module interested in for input
     def watchedEvents(self):
-        return ["DOMAIN_NAME", "DOMAIN_NAME_PARENT", "NETBLOCK_OWNER",
-                "CO_HOSTED_SITE_DOMAIN", "AFFILIATE_DOMAIN", "SIMILARDOMAIN" ]
+        return ["DOMAIN_NAME", "DOMAIN_NAME_PARENT", "NETBLOCK_OWNER", "NETBLOCKV6_OWNER",
+                "CO_HOSTED_SITE_DOMAIN", "AFFILIATE_DOMAIN_NAME", "SIMILARDOMAIN"]
 
     # What events this module produces
     # This is to support the end user in selecting modules based on events
@@ -56,56 +65,69 @@ class sfp_whois(SpiderFootPlugin):
         eventData = event.data
 
         if eventData in self.results:
-            return None
-        else:
-            self.results[eventData] = True
+            return
 
-        self.sf.debug("Received event, " + eventName + ", from " + srcModuleName)
+        self.results[eventData] = True
 
-        try:
-            data = None
-            if eventName != "NETBLOCK_OWNER":
-                whoisdata = whois.whois(eventData)
-                if whoisdata:
-                    data = whoisdata.text
-            else:
-                qry = eventData.split("/")[0]
-                ip = IPAddress(qry) + 1
-                self.sf.debug("Querying for IP ownership of " + str(ip))
-                r = ipwhois.IPWhois(ip)
-                whoisdata = r.lookup_rdap(depth=1)
-                if whoisdata:
-                    data = str(whoisdata)
-            if not data:
-                self.sf.error("Unable to perform WHOIS on " + eventData, False)
-                return None
-        except BaseException as e:
-            self.sf.error("Unable to perform WHOIS on " + eventData + ": " + str(e), False)
-            return None
-
-        # This is likely to be an error about being throttled rather than real data
-        if len(data) < 250:
-            self.sf.error("Throttling from Whois is probably happening.", False)
-            return None
+        self.debug(f"Received event, {eventName}, from {srcModuleName}")
 
         if eventName.startswith("DOMAIN_NAME"):
             typ = "DOMAIN_WHOIS"
-        if eventName.startswith("NETBLOCK"):
+        elif eventName.startswith("NETBLOCK"):
             typ = "NETBLOCK_WHOIS"
-        if eventName.startswith("AFFILIATE_DOMAIN"):
+        elif eventName.startswith("AFFILIATE_DOMAIN_NAME"):
             typ = "AFFILIATE_DOMAIN_WHOIS"
-        if eventName.startswith("CO_HOSTED_SITE_DOMAIN"):
+        elif eventName.startswith("CO_HOSTED_SITE_DOMAIN"):
             typ = "CO_HOSTED_SITE_DOMAIN_WHOIS"
-        if eventName == "SIMILARDOMAIN":
+        elif eventName == "SIMILARDOMAIN":
             typ = "SIMILARDOMAIN_WHOIS"
+        else:
+            self.error(f"Invalid event type: {eventName}")
+            return
+
+        data = None
+
+        if eventName in ["NETBLOCK_OWNER", "NETBLOCKV6_OWNER"]:
+            try:
+                netblock = netaddr.IPNetwork(eventData)
+            except Exception as e:
+                self.error(f"Invalid netblock {eventData}: {e}")
+                return
+
+            ip = netblock[0]
+            self.debug(f"Sending RDAP query for IP address: {ip}")
+
+            try:
+                # TODO: this should use the configured proxy
+                r = ipwhois.IPWhois(ip)
+                data = str(r.lookup_rdap(depth=1))
+            except Exception as e:
+                self.error(f"Unable to perform WHOIS query on {ip}: {e}")
+        else:
+            self.debug(f"Sending WHOIS query for domain: {eventData}")
+            try:
+                whoisdata = whois.whois(eventData)
+                data = str(whoisdata.text)
+            except Exception as e:
+                self.error(f"Unable to perform WHOIS query on {eventData}: {e}")
+
+        if not data:
+            self.error(f"No WHOIS record for {eventData}")
+            return
+
+        # This is likely to be an error about being throttled rather than real data
+        if len(str(data)) < 250:
+            self.error(f"WHOIS data ({len(data)} bytes) is smaller than 250 bytes. Throttling from WHOIS server is probably happening. Ignoring response.")
+            return
 
         rawevt = SpiderFootEvent(typ, data, self.__name__, event)
         self.notifyListeners(rawevt)
 
-        if whoisdata.has_key('registrar'):
-            if eventName.startswith("DOMAIN_NAME") and whoisdata['registrar'] is not None:
-                evt = SpiderFootEvent("DOMAIN_REGISTRAR", whoisdata['registrar'],
-                                      self.__name__, event)
-                self.notifyListeners(evt)
+        if eventName.startswith("DOMAIN_NAME"):
+            if whoisdata:
+                registrar = whoisdata.get('registrar')
+                if registrar:
+                    evt = SpiderFootEvent("DOMAIN_REGISTRAR", registrar, self.__name__, event)
+                    self.notifyListeners(evt)
 
 # End of sfp_whois class
